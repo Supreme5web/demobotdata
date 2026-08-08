@@ -56,6 +56,14 @@ async def update_balance(user_id: str, new_balance: float) -> None:
     await _run(_op)
 
 
+async def get_user_by_id(user_id: str) -> Optional[dict]:
+    def _op():
+        res = supabase.table("users").select("*").eq("id", user_id).limit(1).execute()
+        return res.data[0] if res.data else None
+
+    return await _run(_op)
+
+
 # ---------------------------------------------------------------------------
 # Positions
 # ---------------------------------------------------------------------------
@@ -102,6 +110,17 @@ async def create_position(position: dict) -> dict:
 async def update_position(position_id: str, fields: dict) -> None:
     def _op():
         supabase.table("positions").update(fields).eq("id", position_id).execute()
+
+    await _run(_op)
+
+
+async def set_position_tp_sl(
+    position_id: str, tp_price: Optional[float], sl_price: Optional[float]
+) -> None:
+    def _op():
+        supabase.table("positions").update(
+            {"tp_price": tp_price, "sl_price": sl_price}
+        ).eq("id", position_id).execute()
 
     await _run(_op)
 

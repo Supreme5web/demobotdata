@@ -23,8 +23,15 @@ create table if not exists positions (
     current_price numeric,
     current_market_cap numeric,
     unrealized_pnl numeric default 0,
+    tp_price numeric,
+    sl_price numeric,
     created_at timestamptz not null default now()
 );
+
+-- Safe to re-run: adds TP/SL columns to an existing deployment's positions
+-- table without touching any other data.
+alter table if exists positions add column if not exists tp_price numeric;
+alter table if exists positions add column if not exists sl_price numeric;
 
 create table if not exists trades (
     id uuid primary key default gen_random_uuid(),
