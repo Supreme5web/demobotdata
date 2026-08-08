@@ -48,7 +48,7 @@ async def get_token_data(token_address: str) -> Optional[dict]:
         "market_cap": pair.get("marketCap") or pair.get("fdv") or 0,
         "liquidity_usd": (pair.get("liquidity") or {}).get("usd") or 0,
         "volume_24h": (pair.get("volume") or {}).get("h24") or 0,
-        "price_change_24h": (pair.get("priceChange") or {}).get("h24") or 0,
+        "price_change_1h": (pair.get("priceChange") or {}).get("h1") or 0,
         "pair_address": pair.get("pairAddress", ""),
         "dex_url": pair.get("url", ""),
     }

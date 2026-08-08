@@ -1,4 +1,4 @@
-"""Telegram bot + FastAPI server for the demo (paper) trading bot.
+"""Telegram bot + FastAPI server for PaperBoat - Demo Trading Bot.
 
 No wallets, no private keys, no real transactions - everything here trades
 against a virtual USD balance stored in Supabase.
@@ -40,13 +40,10 @@ SOLANA_CA_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 
 DIVIDER = "━━━━━━━━━━━━━━━━━━━━"
 
-# Preset TP/SL combos offered right after a buy. Each is
-# (label, take_profit_multiple, stop_loss_percent).
-TP_SL_PRESETS = [
-    ("🎯 2x  /  🛑 -20%", 2, 20),
-    ("🎯 3x  /  🛑 -30%", 3, 30),
-    ("🎯 5x  /  🛑 -50%", 5, 50),
-]
+# Take-profit presets, expressed as a multiple of entry market cap (e.g. "2" = 2x).
+TP_PRESETS = [2, 3, 5, 10]
+# Stop-loss presets, expressed as percent below entry market cap.
+SL_PRESETS = [10, 20, 30, 50]
 
 
 # ---------------------------------------------------------------------------
@@ -59,21 +56,6 @@ def fmt_usd(value) -> str:
 
 def fmt_sol(value) -> str:
     return f"{float(value or 0):,.4f} SOL"
-
-
-def fmt_price(value) -> str:
-    price = float(value or 0)
-    if price == 0:
-        return "$0.00"
-    if price >= 1:
-        return f"${price:,.4f}"
-    if price >= 0.01:
-        return f"${price:.6f}"
-    # Very small prices (typical for new memecoins) - show significant digits.
-    formatted = f"{price:.10f}".rstrip("0")
-    if formatted.endswith("."):
-        formatted += "0"
-    return f"${formatted}"
 
 
 def fmt_compact(value) -> str:
@@ -113,14 +95,19 @@ async def balance_block(user: dict) -> str:
     return f"💰 <b>Balance:</b> {fmt_usd(usd_balance)}  <i>(≈ {fmt_sol(sol_equiv)})</i>"
 
 
-def tp_sl_line(entry_price: float, tp_price, sl_price) -> str:
+def tp_sl_line(entry_price: float, entry_mcap: float, tp_price, sl_price) -> str:
+    """TP/SL are stored internally as prices (for precise trigger checks)
+    but displayed as market cap, in line with the rest of the UI."""
+    if not entry_price:
+        return "⚙️ TP/SL: not set"
+
     parts = []
     if tp_price:
-        mult = float(tp_price) / entry_price if entry_price else 0
-        parts.append(f"🎯 TP: {fmt_price(tp_price)} ({mult:.1f}x)")
+        mult = float(tp_price) / entry_price
+        parts.append(f"🎯 TP: {fmt_compact(entry_mcap * mult)} ({mult:.1f}x)")
     if sl_price:
-        pct = ((float(sl_price) / entry_price) - 1) * 100 if entry_price else 0
-        parts.append(f"🛑 SL: {fmt_price(sl_price)} ({pct:+.1f}%)")
+        ratio = float(sl_price) / entry_price
+        parts.append(f"🛑 SL: {fmt_compact(entry_mcap * ratio)} ({(ratio - 1) * 100:+.1f}%)")
     if not parts:
         return "⚙️ TP/SL: not set"
     return "  |  ".join(parts)
@@ -151,16 +138,17 @@ def format_position_card(
 
     timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     chart_url = dex_chart_url(token_address)
+    entry_mcap = float(entry_market_cap or 0)
 
     return (
         f"📌 <b>{html.escape(name)}</b> ({html.escape(symbol)})\n"
         f"<code>{html.escape(token_address)}</code>\n"
         f"{DIVIDER}\n"
-        f"Entry MCap: <b>{fmt_compact(entry_market_cap)}</b>\n"
+        f"Entry MCap: <b>{fmt_compact(entry_mcap)}</b>\n"
         f"Current MCap: <b>{fmt_compact(current_market_cap)}</b>\n"
         f"Tokens Held: {tokens:,.0f}\n"
         f"Invested: {fmt_usd(invested)}\n"
-        f"{tp_sl_line(entry_price, tp_price, sl_price)}\n"
+        f"{tp_sl_line(entry_price, entry_mcap, tp_price, sl_price)}\n"
         f"{DIVIDER}\n"
         f"{emoji} <b>PNL: {fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>\n\n"
         f"📊 <a href=\"{chart_url}\">View Live Chart on DexScreener</a>\n"
@@ -173,12 +161,89 @@ def build_position_keyboard(token_address: str) -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{token_address}")],
             [
+                InlineKeyboardButton("🎯 Set TP", callback_data=f"tpmenu:{token_address}"),
+                InlineKeyboardButton("🛑 Set SL", callback_data=f"slmenu:{token_address}"),
+            ],
+            [
                 InlineKeyboardButton("💸 Sell 50%", callback_data=f"sell:{token_address}:50"),
                 InlineKeyboardButton("💯 Sell 100%", callback_data=f"sell:{token_address}:100"),
             ],
             [InlineKeyboardButton("📊 DexScreener", url=dex_chart_url(token_address))],
         ]
     )
+
+
+def build_tp_menu_keyboard(token_address: str) -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(TP_PRESETS), 2):
+        rows.append(
+            [
+                InlineKeyboardButton(f"🎯 {m}x", callback_data=f"tpset:{token_address}:{m}")
+                for m in TP_PRESETS[i : i + 2]
+            ]
+        )
+    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"tpcustom:{token_address}")])
+    rows.append([InlineKeyboardButton("❌ Clear TP", callback_data=f"tpset:{token_address}:0")])
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{token_address}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_sl_menu_keyboard(token_address: str) -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(SL_PRESETS), 2):
+        rows.append(
+            [
+                InlineKeyboardButton(f"🛑 -{p}%", callback_data=f"slset:{token_address}:{p}")
+                for p in SL_PRESETS[i : i + 2]
+            ]
+        )
+    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"slcustom:{token_address}")])
+    rows.append([InlineKeyboardButton("❌ Clear SL", callback_data=f"slset:{token_address}:0")])
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{token_address}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def render_position_card(user_id: str, token_address: str, live: bool = True):
+    """Builds the (text, keyboard) pair for a position card. Returns None if
+    the position no longer exists. `live=False` reuses the last-known
+    price/mcap from the DB instead of hitting DexScreener again - used for
+    quick menu navigation where a fresh quote isn't necessary."""
+    position = await db.get_position(user_id, token_address)
+    if not position:
+        return None
+
+    entry_price = float(position["entry_price"])
+    entry_mcap = float(position.get("entry_market_cap") or 0)
+    amount = float(position["amount"])
+    invested = float(position["invested_amount"])
+
+    current_price = float(position.get("current_price") or entry_price)
+    current_mcap = float(position.get("current_market_cap") or entry_mcap)
+
+    if live:
+        token_data = await market.get_token_data(token_address)
+        if token_data and token_data["price_usd"] > 0:
+            current_price = token_data["price_usd"]
+            current_mcap = float(token_data.get("market_cap") or 0)
+
+    pnl = (amount * current_price) - invested
+    pnl_pct = (pnl / invested * 100) if invested else 0.0
+
+    text = format_position_card(
+        name=position["token_name"],
+        symbol=position["token_symbol"],
+        token_address=token_address,
+        entry_price=entry_price,
+        entry_market_cap=entry_mcap,
+        current_market_cap=current_mcap,
+        tokens=amount,
+        invested=invested,
+        pnl=pnl,
+        pnl_pct=pnl_pct,
+        tp_price=position.get("tp_price"),
+        sl_price=position.get("sl_price"),
+    )
+    return text, build_position_keyboard(token_address)
 
 
 # ---------------------------------------------------------------------------
@@ -189,20 +254,23 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = await get_user(update)
     balance_line = await balance_block(user)
     await update.message.reply_text(
-        "⚡ <b>TRADEEMDEMO</b> — Solana Paper Trading\n"
+        "⛵ <b>PAPERBOAT</b> — Demo Trading Bot\n"
         f"{DIVIDER}\n"
-        "Practice trading Solana tokens with real live prices and zero risk. "
-        "No wallet, no private keys, no real funds — every trade here is simulated "
-        "against a demo balance.\n\n"
+        "Practice trading Solana tokens with real live market data and zero "
+        "risk. No wallet, no private keys, no real funds — every trade here "
+        "is simulated against a demo balance.\n\n"
         f"{balance_line}\n\n"
-        "<b>How it works:</b>\n"
-        "📩 Send any Solana token contract address to pull up live price, "
-        "market cap, liquidity and volume, then buy straight from the chat.\n\n"
+        "<b>How it works</b>\n"
+        "📩 Send any Solana token contract address to pull up its live "
+        "market cap, volume and 1h change, then buy straight from the chat. "
+        "Set a Take Profit / Stop Loss on any open position and PaperBoat "
+        "will auto-close it the moment your target is hit.\n\n"
         "<b>Commands</b>\n"
         "/balance — check your demo balance\n"
         "/portfolio — view your open positions\n"
         "/history — view your recent trades\n"
-        "/start — show this menu again",
+        "/start — show this menu again\n\n"
+        "🛠️ <i>Built by @supremeesol</i>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -314,11 +382,9 @@ def build_token_info_text(token_data: dict, token_address: str) -> str:
         f"⚡ <b>{html.escape(token_data['name'])}</b> "
         f"(<b>{html.escape(token_data['symbol'])}</b>)\n"
         f"{DIVIDER}\n"
-        f"💰 Price: <b>{fmt_price(token_data['price_usd'])}</b>\n"
-        f"📊 Market Cap: {fmt_compact(token_data['market_cap'])}\n"
-        f"💧 Liquidity: {fmt_compact(token_data['liquidity_usd'])}\n"
+        f"📊 Market Cap: <b>{fmt_compact(token_data['market_cap'])}</b>\n"
         f"📈 Volume (24h): {fmt_compact(token_data['volume_24h'])}\n"
-        f"📉 Change (24h): {fmt_pct(token_data['price_change_24h'])}\n"
+        f"📉 Change (1h): {fmt_pct(token_data['price_change_1h'])}\n"
         f"{DIVIDER}\n"
         f"📄 CA: <code>{html.escape(token_address)}</code>\n\n"
         f"📊 <a href=\"{chart_url}\">View Live Chart on DexScreener</a>"
@@ -398,92 +464,117 @@ async def process_buy(update: Update, target, token_address: str, sol_amount: fl
         await target.reply_text("⚠️ Something went wrong processing that trade. Please try again.")
         return
 
-    sol_price = await market.get_sol_price()
-    new_balance_sol = result["new_balance"] / sol_price if sol_price else 0.0
-
-    confirm_text = (
-        "✅ <b>DEMO BUY EXECUTED</b>\n"
-        f"{DIVIDER}\n"
-        f"Token: <b>{html.escape(result['token_name'])}</b> "
-        f"({html.escape(result['token_symbol'])})\n"
-        f"Spent: {result['sol_amount']:.4f} SOL ({fmt_usd(result['usd_amount'])})\n"
-        f"Entry Price: {fmt_price(result['entry_price'])}\n"
-        f"Tokens: {result['tokens_bought']:,.0f}\n\n"
-        f"💰 Balance: {fmt_usd(result['new_balance'])} "
-        f"<i>(≈ {fmt_sol(new_balance_sol)})</i>\n\n"
-        "🎯 <b>Set Take Profit / Stop Loss?</b>\n"
-        "Auto-sells this position the moment price hits your target — "
-        "no need to watch the chart."
-    )
-    keyboard_rows = [
-        [InlineKeyboardButton(label, callback_data=f"tpsl:{token_address}:{tp}:{sl}")]
-        for label, tp, sl in TP_SL_PRESETS
-    ]
-    keyboard_rows.append(
-        [InlineKeyboardButton("⏭️ Skip (manage manually)", callback_data=f"tpsl:{token_address}:0:0")]
-    )
-
-    await target.reply_text(
-        confirm_text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(keyboard_rows),
-    )
-
-
-async def process_tp_sl_selection(query, token_address: str, tp_mult: float, sl_pct: float) -> None:
-    tg_user = query.from_user
-    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
-
-    position = await db.get_position(user["id"], token_address)
-    if not position:
-        await query.answer("This position is no longer open.", show_alert=True)
-        return
-
-    entry_price = float(position["entry_price"])
-    tp_price = entry_price * tp_mult if tp_mult > 0 else None
-    sl_price = entry_price * (1 - sl_pct / 100) if sl_pct > 0 else None
-
-    await db.set_position_tp_sl(position["id"], tp_price, sl_price)
-
-    amount = float(position["amount"])
-    invested = float(position["invested_amount"])
-    entry_mcap = float(position.get("entry_market_cap") or 0)
+    # Re-read the position so an add-to-existing-position buy still reflects
+    # any TP/SL that was already set on it.
+    position_row = await db.get_position(user["id"], token_address)
+    tp_price = position_row.get("tp_price") if position_row else None
+    sl_price = position_row.get("sl_price") if position_row else None
 
     text = format_position_card(
-        name=position["token_name"],
-        symbol=position["token_symbol"],
+        name=result["token_name"],
+        symbol=result["token_symbol"],
         token_address=token_address,
-        entry_price=entry_price,
-        entry_market_cap=entry_mcap,
-        current_market_cap=entry_mcap,
-        tokens=amount,
-        invested=invested,
+        entry_price=result["entry_price"],
+        entry_market_cap=result["entry_market_cap"],
+        current_market_cap=result["entry_market_cap"],
+        tokens=result["tokens_bought"],
+        invested=result["usd_amount"],
         pnl=0.0,
         pnl_pct=0.0,
         tp_price=tp_price,
         sl_price=sl_price,
     )
+    await target.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_position_keyboard(token_address),
+        disable_web_page_preview=True,
+    )
 
+
+async def process_tp_menu(query, token_address: str) -> None:
     try:
         await query.edit_message_text(
-            text,
+            "🎯 <b>Set Take Profit</b>\n"
+            f"{DIVIDER}\n"
+            "Choose a target as a multiple of your entry market cap "
+            "(e.g. 2x auto-sells once the cap doubles).",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_position_keyboard(token_address),
-            disable_web_page_preview=True,
+            reply_markup=build_tp_menu_keyboard(token_address),
         )
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
             raise
+    await query.answer()
 
-    await query.answer("TP/SL set" if (tp_price or sl_price) else "Skipped — trade set to manual")
+
+async def process_sl_menu(query, token_address: str) -> None:
+    try:
+        await query.edit_message_text(
+            "🛑 <b>Set Stop Loss</b>\n"
+            f"{DIVIDER}\n"
+            "Choose a target as a percent below your entry market cap "
+            "(e.g. -20% auto-sells if the cap drops that far).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_sl_menu_keyboard(token_address),
+        )
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+    await query.answer()
 
 
-async def process_refresh(query, token_address: str) -> None:
+async def apply_tp(user_id: str, token_address: str, multiple: float):
+    position = await db.get_position(user_id, token_address)
+    if not position:
+        return None
+    entry_price = float(position["entry_price"])
+    tp_price = entry_price * multiple if multiple > 0 else None
+    sl_price = position.get("sl_price")
+    await db.set_position_tp_sl(position["id"], tp_price, sl_price)
+    return True
+
+
+async def apply_sl(user_id: str, token_address: str, percent: float):
+    position = await db.get_position(user_id, token_address)
+    if not position:
+        return None
+    entry_price = float(position["entry_price"])
+    sl_price = entry_price * (1 - percent / 100) if percent > 0 else None
+    tp_price = position.get("tp_price")
+    await db.set_position_tp_sl(position["id"], tp_price, sl_price)
+    return True
+
+
+async def process_tp_set(query, token_address: str, multiple: float) -> None:
     tg_user = query.from_user
     user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
 
-    position = await db.get_position(user["id"], token_address)
-    if not position:
+    applied = await apply_tp(user["id"], token_address, multiple)
+    if applied is None:
+        await query.answer("This position is no longer open.", show_alert=True)
+        return
+
+    await show_position_card(query, user["id"], token_address, live=False)
+    await query.answer("Take Profit set" if multiple > 0 else "Take Profit cleared")
+
+
+async def process_sl_set(query, token_address: str, percent: float) -> None:
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+
+    applied = await apply_sl(user["id"], token_address, percent)
+    if applied is None:
+        await query.answer("This position is no longer open.", show_alert=True)
+        return
+
+    await show_position_card(query, user["id"], token_address, live=False)
+    await query.answer("Stop Loss set" if percent > 0 else "Stop Loss cleared")
+
+
+async def show_position_card(query, user_id: str, token_address: str, live: bool = True) -> None:
+    rendered = await render_position_card(user_id, token_address, live=live)
+    if not rendered:
         await query.answer("This position has been closed.", show_alert=True)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
@@ -491,47 +582,31 @@ async def process_refresh(query, token_address: str) -> None:
             pass
         return
 
-    token_data = await market.get_token_data(token_address)
-    if not token_data or token_data["price_usd"] <= 0:
-        await query.answer("Couldn't fetch a live price right now. Try again shortly.", show_alert=True)
-        return
-
-    amount = float(position["amount"])
-    invested = float(position["invested_amount"])
-    entry_price = float(position["entry_price"])
-    current_price = token_data["price_usd"]
-    current_mcap = float(token_data.get("market_cap") or 0)
-    entry_mcap = float(position.get("entry_market_cap") or current_mcap)
-    pnl = (amount * current_price) - invested
-    pnl_pct = (pnl / invested * 100) if invested else 0.0
-
-    text = format_position_card(
-        name=position["token_name"],
-        symbol=position["token_symbol"],
-        token_address=token_address,
-        entry_price=entry_price,
-        entry_market_cap=entry_mcap,
-        current_market_cap=current_mcap,
-        tokens=amount,
-        invested=invested,
-        pnl=pnl,
-        pnl_pct=pnl_pct,
-        tp_price=position.get("tp_price"),
-        sl_price=position.get("sl_price"),
-    )
-
+    text, keyboard = rendered
     try:
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=build_position_keyboard(token_address),
+            reply_markup=keyboard,
             disable_web_page_preview=True,
         )
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
             raise
 
+
+async def process_refresh(query, token_address: str) -> None:
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+    await show_position_card(query, user["id"], token_address, live=True)
     await query.answer("Updated")
+
+
+async def process_back_to_position(query, token_address: str) -> None:
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+    await show_position_card(query, user["id"], token_address, live=False)
+    await query.answer()
 
 
 async def process_sell(update: Update, target, token_address: str, percent: float) -> None:
@@ -555,8 +630,8 @@ async def process_sell(update: Update, target, token_address: str, percent: floa
         f"{DIVIDER}\n"
         f"Token: <b>{html.escape(result['token_name'])}</b> "
         f"({html.escape(result['token_symbol'])})\n"
-        f"Entry: {fmt_price(result['entry_price'])}\n"
-        f"Exit: {fmt_price(result['exit_price'])}\n"
+        f"Entry MCap: {fmt_compact(result['entry_market_cap'])}\n"
+        f"Exit MCap: {fmt_compact(result['exit_market_cap'])}\n"
         f"Received: {fmt_usd(result['proceeds'])}\n"
         f"{emoji} <b>PNL: {fmt_usd(result['pnl'])} ({result['pnl_pct']:+.2f}%)</b>\n\n"
         f"💰 Balance: {fmt_usd(result['new_balance'])} "
@@ -579,6 +654,52 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await process_buy(update, update.message, pending_ca, amount)
         return
 
+    pending_tp = context.user_data.get("awaiting_custom_tp")
+    if pending_tp:
+        context.user_data.pop("awaiting_custom_tp", None)
+        try:
+            multiple = float(text)
+            if multiple <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please send a valid multiple, e.g. 4 for 4x")
+            return
+        user = await get_user(update)
+        applied = await apply_tp(user["id"], pending_tp, multiple)
+        if applied is None:
+            await update.message.reply_text("That position is no longer open.")
+            return
+        rendered = await render_position_card(user["id"], pending_tp, live=False)
+        if rendered:
+            text_out, keyboard = rendered
+            await update.message.reply_text(
+                text_out, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True
+            )
+        return
+
+    pending_sl = context.user_data.get("awaiting_custom_sl")
+    if pending_sl:
+        context.user_data.pop("awaiting_custom_sl", None)
+        try:
+            percent = float(text)
+            if percent <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please send a valid percent, e.g. 25 for -25%")
+            return
+        user = await get_user(update)
+        applied = await apply_sl(user["id"], pending_sl, percent)
+        if applied is None:
+            await update.message.reply_text("That position is no longer open.")
+            return
+        rendered = await render_position_card(user["id"], pending_sl, live=False)
+        if rendered:
+            text_out, keyboard = rendered
+            await update.message.reply_text(
+                text_out, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True
+            )
+        return
+
     if SOLANA_CA_REGEX.match(text):
         await show_token_info(update, text)
 
@@ -590,9 +711,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     action = parts[0] if parts else ""
 
     # Each branch answers the callback query exactly once - Telegram rejects
-    # a second answer() call on the same query, so `refresh`/`refreshtoken`/
-    # `tpsl` handle their own (with a toast/alert) instead of us answering
-    # here up front.
+    # a second answer() call on the same query, so several branches handle
+    # their own (with a toast/alert) instead of us answering here up front.
     if action == "buy" and len(parts) == 3:
         await query.answer()
         token_address, amount_str = parts[1], parts[2]
@@ -607,14 +727,27 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         token_address, percent_str = parts[1], parts[2]
         await process_sell(update, query.message, token_address, float(percent_str))
     elif action == "refresh" and len(parts) == 2:
-        token_address = parts[1]
-        await process_refresh(query, token_address)
+        await process_refresh(query, parts[1])
     elif action == "refreshtoken" and len(parts) == 2:
-        token_address = parts[1]
-        await process_refresh_token(query, token_address)
-    elif action == "tpsl" and len(parts) == 4:
-        token_address, tp_str, sl_str = parts[1], parts[2], parts[3]
-        await process_tp_sl_selection(query, token_address, float(tp_str), float(sl_str))
+        await process_refresh_token(query, parts[1])
+    elif action == "tpmenu" and len(parts) == 2:
+        await process_tp_menu(query, parts[1])
+    elif action == "slmenu" and len(parts) == 2:
+        await process_sl_menu(query, parts[1])
+    elif action == "tpset" and len(parts) == 3:
+        await process_tp_set(query, parts[1], float(parts[2]))
+    elif action == "slset" and len(parts) == 3:
+        await process_sl_set(query, parts[1], float(parts[2]))
+    elif action == "tpcustom" and len(parts) == 2:
+        await query.answer()
+        context.user_data["awaiting_custom_tp"] = parts[1]
+        await query.message.reply_text("Send your TP as a multiple of entry market cap, e.g. 4 for 4x")
+    elif action == "slcustom" and len(parts) == 2:
+        await query.answer()
+        context.user_data["awaiting_custom_sl"] = parts[1]
+        await query.message.reply_text("Send your SL as a percent below entry market cap, e.g. 25 for -25%")
+    elif action == "backpos" and len(parts) == 2:
+        await process_back_to_position(query, parts[1])
     else:
         await query.answer()
 
@@ -665,8 +798,8 @@ async def check_tp_sl_triggers() -> None:
             f"{DIVIDER}\n"
             f"Token: <b>{html.escape(result['token_name'])}</b> "
             f"({html.escape(result['token_symbol'])})\n"
-            f"Entry: {fmt_price(result['entry_price'])}\n"
-            f"Exit: {fmt_price(result['exit_price'])}\n"
+            f"Entry MCap: {fmt_compact(result['entry_market_cap'])}\n"
+            f"Exit MCap: {fmt_compact(result['exit_market_cap'])}\n"
             f"Received: {fmt_usd(result['proceeds'])}\n"
             f"{emoji} <b>PNL: {fmt_usd(result['pnl'])} ({result['pnl_pct']:+.2f}%)</b>\n\n"
             f"💰 Balance: {fmt_usd(result['new_balance'])} "
@@ -703,8 +836,8 @@ BOT_COMMANDS = [
 
 
 async def price_update_loop() -> None:
-    """Background task: refresh open position prices/PNL every 30s, then
-    check for any take-profit/stop-loss targets that were hit."""
+    """Background task: refresh open position prices/mcap/PNL every 30s,
+    then check for any take-profit/stop-loss targets that were hit."""
     while True:
         try:
             await trading.refresh_all_positions()
@@ -725,7 +858,7 @@ async def lifespan(app: FastAPI):
     await telegram_app.start()
     await telegram_app.updater.start_polling(drop_pending_updates=True)
     price_task = asyncio.create_task(price_update_loop())
-    logger.info("Telegram bot started and polling for updates.")
+    logger.info("PaperBoat bot started and polling for updates.")
 
     try:
         yield
@@ -734,7 +867,7 @@ async def lifespan(app: FastAPI):
         await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
-        logger.info("Telegram bot stopped.")
+        logger.info("PaperBoat bot stopped.")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -742,4 +875,4 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def root():
-    return {"status": "running"}
+    return {"status": "running", "bot": "PaperBoat - Demo Trading Bot"}

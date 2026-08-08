@@ -120,9 +120,11 @@ async def execute_sell(user: dict, token_address: str, percent: float) -> dict:
         raise TradingError("Could not fetch a valid price for this token right now.")
 
     exit_price = token_data["price_usd"]
+    exit_market_cap = float(token_data.get("market_cap") or 0)
     total_amount = float(position["amount"])
     sell_amount = total_amount * (percent / 100)
     entry_price = float(position["entry_price"])
+    entry_market_cap = float(position.get("entry_market_cap") or 0)
 
     proceeds = sell_amount * exit_price
     cost_basis = sell_amount * entry_price
@@ -165,6 +167,8 @@ async def execute_sell(user: dict, token_address: str, percent: float) -> dict:
         "token_symbol": position["token_symbol"],
         "entry_price": entry_price,
         "exit_price": exit_price,
+        "entry_market_cap": entry_market_cap,
+        "exit_market_cap": exit_market_cap,
         "proceeds": proceeds,
         "pnl": pnl,
         "pnl_pct": pnl_pct,
