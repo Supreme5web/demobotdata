@@ -92,7 +92,7 @@ async def balance_block(user: dict) -> str:
     usd_balance = float(user["balance"])
     sol_price = await market.get_sol_price()
     sol_equiv = usd_balance / sol_price if sol_price else 0.0
-    return f"💰 <b>Balance:</b> {fmt_usd(usd_balance)}  <i>(≈ {fmt_sol(sol_equiv)})</i>"
+    return f"💰 Balance: <b>{fmt_usd(usd_balance)}</b>\n≈ {fmt_sol(sol_equiv)}"
 
 
 def tp_sl_line(entry_price: float, entry_mcap: float, tp_price, sl_price) -> str:
@@ -254,23 +254,20 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = await get_user(update)
     balance_line = await balance_block(user)
     await update.message.reply_text(
-        "⛵ <b>PAPERBOAT</b> — Demo Trading Bot\n"
-        f"{DIVIDER}\n"
-        "Practice trading Solana tokens with real live market data and zero "
-        "risk. No wallet, no private keys, no real funds — every trade here "
-        "is simulated against a demo balance.\n\n"
+        "🚤 <b>PAPERBOAT</b> — Demo Trading Bot\n"
+        "Practice Solana trading with real market data and zero risk.\n"
+        "No wallet. No private keys. No real funds.\n"
+        "All trades are simulated with a demo balance.\n\n"
         f"{balance_line}\n\n"
-        "<b>How it works</b>\n"
-        "📩 Send any Solana token contract address to pull up its live "
-        "market cap, volume and 1h change, then buy straight from the chat. "
-        "Set a Take Profit / Stop Loss on any open position and PaperBoat "
-        "will auto-close it the moment your target is hit.\n\n"
-        "<b>Commands</b>\n"
-        "/balance — check your demo balance\n"
-        "/portfolio — view your open positions\n"
-        "/history — view your recent trades\n"
-        "/start — show this menu again\n\n"
-        "🛠️ <i>Built by @supremeesol</i>",
+        "📩 Send any Solana token CA to view live data and trade.\n"
+        "🎯 Set Take Profit / Stop Loss and let PaperBoat manage your "
+        "positions automatically.\n\n"
+        "<b>Commands:</b>\n"
+        "/balance — Check balance\n"
+        "/portfolio — Open positions\n"
+        "/history — Trade history\n"
+        "/start — Show menu\n\n"
+        "🛠 Built by @supremeesol",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
