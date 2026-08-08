@@ -32,6 +32,7 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
         )
 
     entry_price = token_data["price_usd"]
+    entry_market_cap = float(token_data.get("market_cap") or 0)
     tokens_bought = usd_amount / entry_price
     new_balance = balance - usd_amount
 
@@ -41,16 +42,25 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
     if existing:
         old_amount = float(existing["amount"])
         old_invested = float(existing["invested_amount"])
+        old_entry_mcap = float(existing.get("entry_market_cap") or entry_market_cap)
         new_amount = old_amount + tokens_bought
         new_invested = old_invested + usd_amount
         new_entry_price = new_invested / new_amount if new_amount else entry_price
+        # Weight the blended entry market cap by invested amount, same approach as entry price.
+        new_entry_mcap = (
+            ((old_entry_mcap * old_invested) + (entry_market_cap * usd_amount)) / new_invested
+            if new_invested
+            else entry_market_cap
+        )
         await db.update_position(
             existing["id"],
             {
                 "amount": new_amount,
                 "invested_amount": new_invested,
                 "entry_price": new_entry_price,
+                "entry_market_cap": new_entry_mcap,
                 "current_price": entry_price,
+                "current_market_cap": entry_market_cap,
             },
         )
     else:
@@ -62,8 +72,10 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
                 "token_name": token_data["name"],
                 "amount": tokens_bought,
                 "entry_price": entry_price,
+                "entry_market_cap": entry_market_cap,
                 "invested_amount": usd_amount,
                 "current_price": entry_price,
+                "current_market_cap": entry_market_cap,
                 "unrealized_pnl": 0,
             }
         )
@@ -84,9 +96,11 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
     return {
         "token_name": token_data["name"],
         "token_symbol": token_data["symbol"],
+        "token_address": token_address,
         "sol_amount": sol_amount,
         "usd_amount": usd_amount,
         "entry_price": entry_price,
+        "entry_market_cap": entry_market_cap,
         "tokens_bought": tokens_bought,
         "new_balance": new_balance,
     }
@@ -159,19 +173,25 @@ async def execute_sell(user: dict, token_address: str, percent: float) -> dict:
 
 
 async def refresh_all_positions() -> None:
-    """Refresh current price and unrealized PNL for every open position."""
+    """Refresh current price, market cap, and unrealized PNL for every open position."""
     positions = await db.get_all_positions()
     for pos in positions:
         try:
-            price = await market.get_current_price(pos["token_address"])
-            if price is None:
+            token_data = await market.get_token_data(pos["token_address"])
+            if not token_data or token_data["price_usd"] <= 0:
                 continue
+            price = token_data["price_usd"]
+            market_cap = float(token_data.get("market_cap") or 0)
             amount = float(pos["amount"])
             invested = float(pos["invested_amount"])
             unrealized_pnl = (price * amount) - invested
             await db.update_position(
                 pos["id"],
-                {"current_price": price, "unrealized_pnl": unrealized_pnl},
+                {
+                    "current_price": price,
+                    "current_market_cap": market_cap,
+                    "unrealized_pnl": unrealized_pnl,
+                },
             )
         except Exception as exc:  # noqa: BLE001 - keep the loop alive on any single failure
             logger.error("Failed to refresh position %s: %s", pos.get("id"), exc)

@@ -5,13 +5,16 @@ against a virtual USD balance stored in Supabase.
 """
 
 import asyncio
+import html
 import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -75,6 +78,52 @@ async def get_user(update: Update) -> dict:
     return await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
 
 
+def format_position_card(
+    *,
+    name: str,
+    symbol: str,
+    token_address: str,
+    entry_market_cap,
+    current_market_cap,
+    tokens: float,
+    invested: float,
+    pnl: float,
+    pnl_pct: float,
+) -> str:
+    """Render a clean, refreshable position summary keyed on market cap."""
+    if pnl > 0:
+        emoji = "🟢"
+    elif pnl < 0:
+        emoji = "🔴"
+    else:
+        emoji = "⚪"
+
+    timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+
+    return (
+        f"<b>{html.escape(name)}</b> ({html.escape(symbol)})\n"
+        f"<code>{html.escape(token_address)}</code>\n\n"
+        f"Entry MCap: {fmt_compact(entry_market_cap)}\n"
+        f"Current MCap: {fmt_compact(current_market_cap)}\n"
+        f"Tokens: {tokens:,.0f}\n"
+        f"Invested: {fmt_usd(invested)}\n\n"
+        f"{emoji} PNL: {fmt_usd(pnl)} ({pnl_pct:+.2f}%)\n\n"
+        f"<i>Updated {timestamp}</i>"
+    )
+
+
+def build_position_keyboard(token_address: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{token_address}")],
+            [
+                InlineKeyboardButton("Sell 50%", callback_data=f"sell:{token_address}:50"),
+                InlineKeyboardButton("Sell 100%", callback_data=f"sell:{token_address}:100"),
+            ],
+        ]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
@@ -115,29 +164,29 @@ async def portfolio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     for pos in positions:
         amount = float(pos["amount"])
-        entry = float(pos["entry_price"])
-        current = float(pos["current_price"] or entry)
         invested = float(pos["invested_amount"])
-        current_value = amount * current
+        entry_mcap = float(pos.get("entry_market_cap") or 0)
+        current_mcap = float(pos.get("current_market_cap") or entry_mcap)
+        current_price = float(pos.get("current_price") or pos["entry_price"])
+        current_value = amount * current_price
         pnl = current_value - invested
         pnl_pct = (pnl / invested * 100) if invested else 0.0
-        emoji = "🟢" if pnl >= 0 else "🔴"
 
-        text = (
-            f"*{pos['token_name']}* ({pos['token_symbol']})\n"
-            f"Amount: {amount:,.2f}\n"
-            f"Entry: {fmt_price(entry)}\n"
-            f"Current: {fmt_price(current)}\n"
-            f"{emoji} PNL: {fmt_usd(pnl)} ({pnl_pct:+.2f}%)"
+        text = format_position_card(
+            name=pos["token_name"],
+            symbol=pos["token_symbol"],
+            token_address=pos["token_address"],
+            entry_market_cap=entry_mcap,
+            current_market_cap=current_mcap,
+            tokens=amount,
+            invested=invested,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
         )
-        keyboard = [
-            [
-                InlineKeyboardButton("Sell 50%", callback_data=f"sell:{pos['token_address']}:50"),
-                InlineKeyboardButton("Sell 100%", callback_data=f"sell:{pos['token_address']}:100"),
-            ]
-        ]
         await update.message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard)
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_position_keyboard(pos["token_address"]),
         )
 
 
@@ -212,15 +261,75 @@ async def process_buy(update: Update, target, token_address: str, sol_amount: fl
         await target.reply_text("⚠️ Something went wrong processing that trade. Please try again.")
         return
 
-    text = (
-        "🟢 *DEMO BUY*\n\n"
-        f"Token: {result['token_name']} ({result['token_symbol']})\n"
-        f"Invested: {result['sol_amount']:g} SOL (~{fmt_usd(result['usd_amount'])})\n"
-        f"Entry: {fmt_price(result['entry_price'])}\n"
-        f"Tokens: {result['tokens_bought']:,.0f}\n"
-        f"Balance: {fmt_usd(result['new_balance'])}"
+    # A fresh buy has zero PNL until the price/market cap moves - the refresh
+    # button lets the user pull live numbers on demand without re-issuing a command.
+    text = format_position_card(
+        name=result["token_name"],
+        symbol=result["token_symbol"],
+        token_address=token_address,
+        entry_market_cap=result["entry_market_cap"],
+        current_market_cap=result["entry_market_cap"],
+        tokens=result["tokens_bought"],
+        invested=result["usd_amount"],
+        pnl=0.0,
+        pnl_pct=0.0,
     )
-    await target.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await target.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_position_keyboard(token_address),
+    )
+
+
+async def process_refresh(query, token_address: str) -> None:
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+
+    position = await db.get_position(user["id"], token_address)
+    if not position:
+        await query.answer("This position has been closed.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+        return
+
+    token_data = await market.get_token_data(token_address)
+    if not token_data or token_data["price_usd"] <= 0:
+        await query.answer("Couldn't fetch a live price right now. Try again shortly.", show_alert=True)
+        return
+
+    amount = float(position["amount"])
+    invested = float(position["invested_amount"])
+    current_price = token_data["price_usd"]
+    current_mcap = float(token_data.get("market_cap") or 0)
+    entry_mcap = float(position.get("entry_market_cap") or current_mcap)
+    pnl = (amount * current_price) - invested
+    pnl_pct = (pnl / invested * 100) if invested else 0.0
+
+    text = format_position_card(
+        name=position["token_name"],
+        symbol=position["token_symbol"],
+        token_address=token_address,
+        entry_market_cap=entry_mcap,
+        current_market_cap=current_mcap,
+        tokens=amount,
+        invested=invested,
+        pnl=pnl,
+        pnl_pct=pnl_pct,
+    )
+
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_position_keyboard(token_address),
+        )
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+
+    await query.answer("Updated")
 
 
 async def process_sell(update: Update, target, token_address: str, percent: float) -> None:
@@ -268,21 +377,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     data = query.data or ""
     parts = data.split(":")
     action = parts[0] if parts else ""
 
+    # Each branch answers the callback query exactly once - Telegram rejects
+    # a second answer() call on the same query, so `refresh` handles its own
+    # (with a toast/alert) instead of us answering here up front.
     if action == "buy" and len(parts) == 3:
+        await query.answer()
         token_address, amount_str = parts[1], parts[2]
         await process_buy(update, query.message, token_address, float(amount_str))
     elif action == "buycustom" and len(parts) == 2:
+        await query.answer()
         token_address = parts[1]
         context.user_data["awaiting_custom_buy"] = token_address
         await query.message.reply_text("Send the amount of SOL you'd like to spend, e.g. 0.75")
     elif action == "sell" and len(parts) == 3:
+        await query.answer()
         token_address, percent_str = parts[1], parts[2]
         await process_sell(update, query.message, token_address, float(percent_str))
+    elif action == "refresh" and len(parts) == 2:
+        token_address = parts[1]
+        await process_refresh(query, token_address)
+    else:
+        await query.answer()
 
 
 # ---------------------------------------------------------------------------

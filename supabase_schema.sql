@@ -18,8 +18,10 @@ create table if not exists positions (
     token_name text not null,
     amount numeric not null,
     entry_price numeric not null,
+    entry_market_cap numeric,
     invested_amount numeric not null,
     current_price numeric,
+    current_market_cap numeric,
     unrealized_pnl numeric default 0,
     created_at timestamptz not null default now()
 );
