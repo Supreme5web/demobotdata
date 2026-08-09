@@ -127,11 +127,11 @@ async def send_pnl_card(bot, chat_id: int, result: dict, reason: str) -> None:
                 logger.warning("Could not delete temp PNL card file %s", path)
 
 
-def dex_chart_url(token_address: str, fallback: str = "") -> str:
-    """Best-effort DexScreener chart link. Prefers the exact pair URL from
-    the API response; falls back to the generic token-address route, which
-    DexScreener resolves to the most liquid pair."""
-    return fallback or f"https://dexscreener.com/solana/{token_address}"
+def token_chart_url(token_address: str, fallback: str = "") -> str:
+    """Best-effort live chart link. Prefers an exact pair/pool URL from the
+    API response when available; falls back to the generic Solana Tracker
+    token page."""
+    return fallback or f"https://www.solanatracker.io/token/{token_address}"
 
 
 async def get_user(update: Update) -> dict:
@@ -189,7 +189,7 @@ def format_position_card(
         emoji = "⚪"
 
     timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    chart_url = dex_chart_url(token_address)
+    chart_url = token_chart_url(token_address)
     entry_mcap = float(entry_market_cap or 0)
 
     return (
@@ -203,7 +203,7 @@ def format_position_card(
         f"{tp_sl_line(entry_price, entry_mcap, tp_price, sl_price)}\n"
         f"{DIVIDER}\n"
         f"{emoji} <b>PNL: {fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>\n\n"
-        f"📊 <a href=\"{chart_url}\">View Live Chart on DexScreener</a>\n"
+        f"📊 <a href=\"{chart_url}\">View Live Chart</a>\n"
         f"<i>Updated {timestamp}</i>"
     )
 
@@ -220,7 +220,7 @@ def build_position_keyboard(token_address: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("💸 Sell 50%", callback_data=f"sell:{token_address}:50"),
                 InlineKeyboardButton("💯 Sell 100%", callback_data=f"sell:{token_address}:100"),
             ],
-            [InlineKeyboardButton("📊 DexScreener", url=dex_chart_url(token_address))],
+            [InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address))],
         ]
     )
 
@@ -258,7 +258,7 @@ def build_sl_menu_keyboard(token_address: str) -> InlineKeyboardMarkup:
 async def render_position_card(user_id: str, token_address: str, live: bool = True):
     """Builds the (text, keyboard) pair for a position card. Returns None if
     the position no longer exists. `live=False` reuses the last-known
-    price/mcap from the DB instead of hitting DexScreener again - used for
+    price/mcap from the DB instead of hitting the market data API again - used for
     quick menu navigation where a fresh quote isn't necessary."""
     position = await db.get_position(user_id, token_address)
     if not position:
@@ -316,7 +316,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "positions automatically.\n\n"
         "<b>Commands:</b>\n"
         "/balance — Check balance\n"
-        "/portfolio — Open positions\n"
+        "/positions — Open positions\n"
         "/history — Trade history\n"
         "/start — Show menu\n\n"
         "🛠 Built by @supremeesol",
@@ -334,7 +334,7 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
-async def portfolio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await get_user(update)
     positions = await db.get_positions(user["id"])
 
@@ -359,7 +359,7 @@ async def portfolio_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     overview_emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
 
     overview = (
-        "📊 <b>PORTFOLIO OVERVIEW</b>\n"
+        "📊 <b>POSITIONS OVERVIEW</b>\n"
         f"{DIVIDER}\n"
         f"Open Positions: <b>{len(positions)}</b>\n"
         f"Total Invested: {fmt_usd(total_invested)}\n"
@@ -426,7 +426,7 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ---------------------------------------------------------------------------
 
 def build_token_info_text(token_data: dict, token_address: str) -> str:
-    chart_url = dex_chart_url(token_address, token_data.get("dex_url", ""))
+    chart_url = token_chart_url(token_address, token_data.get("dex_url", ""))
     return (
         f"⚡ <b>{html.escape(token_data['name'])}</b> "
         f"(<b>{html.escape(token_data['symbol'])}</b>)\n"
@@ -436,7 +436,7 @@ def build_token_info_text(token_data: dict, token_address: str) -> str:
         f"📉 Change (1h): {fmt_pct(token_data['price_change_1h'])}\n"
         f"{DIVIDER}\n"
         f"📄 CA: <code>{html.escape(token_address)}</code>\n\n"
-        f"📊 <a href=\"{chart_url}\">View Live Chart on DexScreener</a>"
+        f"📊 <a href=\"{chart_url}\">View Live Chart</a>"
     )
 
 
@@ -453,7 +453,7 @@ def build_token_info_keyboard(token_address: str, dex_url: str = "") -> InlineKe
         [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"buycustom:{token_address}")],
         [
             InlineKeyboardButton("🔄 Refresh", callback_data=f"refreshtoken:{token_address}"),
-            InlineKeyboardButton("📊 DexScreener", url=dex_chart_url(token_address, dex_url)),
+            InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address, dex_url)),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -883,7 +883,7 @@ telegram_app: Application = Application.builder().token(config.TELEGRAM_TOKEN).b
 
 telegram_app.add_handler(CommandHandler("start", start_handler))
 telegram_app.add_handler(CommandHandler("balance", balance_handler))
-telegram_app.add_handler(CommandHandler("portfolio", portfolio_handler))
+telegram_app.add_handler(CommandHandler("positions", positions_handler))
 telegram_app.add_handler(CommandHandler("history", history_handler))
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
@@ -891,7 +891,7 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_ha
 BOT_COMMANDS = [
     BotCommand("start", "Welcome & how it works"),
     BotCommand("balance", "Check your demo balance"),
-    BotCommand("portfolio", "View your open positions"),
+    BotCommand("positions", "View your open positions"),
     BotCommand("history", "View your recent trades"),
 ]
 

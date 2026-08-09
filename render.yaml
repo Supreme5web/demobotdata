@@ -12,3 +12,5 @@ services:
         sync: false
       - key: TELEGRAM_TOKEN
         sync: false
+      - key: SOLANATRACKER_API_KEY
+        sync: false
