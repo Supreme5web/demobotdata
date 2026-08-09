@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "assets", "pnl_card_template.png")
 
-FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+FONT_DIR = os.path.join(os.path.dirname(__file__), "assets", "fonts")
 FONT_BOLD = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
 FONT_REGULAR = os.path.join(FONT_DIR, "DejaVuSans.ttf")
-EMOJI_FONT = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
+EMOJI_FONT = os.path.join(FONT_DIR, "NotoColorEmoji.ttf")
 
 # Colors
 WHITE = (255, 255, 255, 255)
@@ -61,11 +61,17 @@ def _is_emoji(ch: str) -> bool:
 _EMOJI_FONT_CACHE = {}
 
 
-def _emoji_font(px_size: int) -> ImageFont.FreeTypeFont:
+def _emoji_font(px_size: int) -> Optional[ImageFont.FreeTypeFont]:
     """NotoColorEmoji only ships strike size 109; request that and resize
-    the rendered glyph to the size we actually need."""
+    the rendered glyph to the size we actually need. Returns None (instead
+    of raising) if the font can't be loaded, so a font/environment issue
+    degrades to plain text rather than crashing card generation."""
     if 109 not in _EMOJI_FONT_CACHE:
-        _EMOJI_FONT_CACHE[109] = ImageFont.truetype(EMOJI_FONT, 109)
+        try:
+            _EMOJI_FONT_CACHE[109] = ImageFont.truetype(EMOJI_FONT, 109)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load emoji font at %s: %s", EMOJI_FONT, exc)
+            _EMOJI_FONT_CACHE[109] = None
     return _EMOJI_FONT_CACHE[109]
 
 
@@ -83,6 +89,9 @@ def draw_text_with_emoji(overlay: Image.Image, xy, text: str, font: ImageFont.Fr
     for ch in text:
         if _is_emoji(ch):
             efont = _emoji_font(emoji_px)
+            if efont is None:
+                # Emoji font unavailable - skip the glyph rather than crash.
+                continue
             bbox = efont.getbbox(ch)
             glyph_w = bbox[2] - bbox[0] if bbox else emoji_px
             # Render the emoji at native strike size on its own canvas, then
