@@ -137,6 +137,19 @@ def _fmt_usd(value: float) -> str:
     return f"${value:,.{min(decimals, 10)}f}"
 
 
+def _fmt_compact(value) -> str:
+    """Compact market-cap style formatting: $1.24M, $850.0K, etc. Mirrors
+    the fmt_compact() helper already used elsewhere in the bot for MCap."""
+    v = float(value or 0)
+    if v >= 1_000_000_000:
+        return f"${v / 1_000_000_000:.2f}B"
+    if v >= 1_000_000:
+        return f"${v / 1_000_000:.2f}M"
+    if v >= 1_000:
+        return f"${v / 1_000:.1f}K"
+    return f"${v:,.0f}"
+
+
 def _fit_text(draw: ImageDraw.ImageDraw, text: str, font_path: str, max_width: int,
               start_size: int, min_size: int = 24) -> ImageFont.FreeTypeFont:
     """Shrinks font size until `text` fits within max_width, down to a floor."""
@@ -204,20 +217,18 @@ def generate_pnl_card(trade: dict) -> str:
     temporary file. Caller is responsible for deleting the file after use.
 
     Expected keys in `trade`:
-        token_name, token_symbol, entry_price, exit_price,
+        token_name, token_symbol, entry_market_cap, exit_market_cap,
         invested, final_value, pnl, pnl_pct, duration_seconds,
-        reason ("tp" | "sl" | "manual"), logo_url (optional)
+        logo_url (optional)
     """
     base = Image.open(TEMPLATE_PATH).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     header_font = _font(FONT_BOLD, 40)
-    name_font = _font(FONT_BOLD, 52)
     symbol_font = _font(FONT_REGULAR, 30)
     label_font = _font(FONT_REGULAR, 22)
     value_font = _font(FONT_BOLD, 40)
-    reason_font = _font(FONT_BOLD, 30)
 
     pnl = float(trade["pnl"])
     pnl_pct = float(trade["pnl_pct"])
@@ -258,9 +269,9 @@ def generate_pnl_card(trade: dict) -> str:
     row_h = 100
     col2_x = x + COL_GAP
 
-    _stat(draw, x, y, "ENTRY", _fmt_usd(float(trade["entry_price"])),
+    _stat(draw, x, y, "ENTRY MCAP", _fmt_compact(trade["entry_market_cap"]),
           label_font=label_font, value_font=value_font)
-    _stat(draw, col2_x, y, "EXIT", _fmt_usd(float(trade["exit_price"])),
+    _stat(draw, col2_x, y, "EXIT MCAP", _fmt_compact(trade["exit_market_cap"]),
           label_font=label_font, value_font=value_font)
 
     y += row_h
@@ -278,15 +289,6 @@ def generate_pnl_card(trade: dict) -> str:
     y += row_h
     _stat(draw, x, y, "DURATION", _format_duration(trade.get("duration_seconds", 0)),
           label_font=label_font, value_font=value_font)
-
-    reason_map = {
-        "tp": ("Take Profit ✅", GREEN),
-        "sl": ("Stop Loss 🛑", RED),
-        "manual": ("Manual Sell 👋", CYAN),
-    }
-    reason_text, reason_color = reason_map.get(trade.get("reason", "manual"), reason_map["manual"])
-    draw.text((col2_x, y), "REASON", font=label_font, fill=LABEL_GRAY)
-    draw_text_with_emoji(overlay, (col2_x, y + 30), reason_text, reason_font, reason_color, emoji_px=32)
 
     # --- Composite + save -----------------------------------------------------
     final_img = Image.alpha_composite(base, overlay).convert("RGB")

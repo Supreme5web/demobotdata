@@ -96,19 +96,19 @@ def _seconds_since(iso_timestamp) -> float:
 async def send_pnl_card(bot, chat_id: int, result: dict, reason: str) -> None:
     """Renders a PaperBoat PNL card for a just-closed position and sends it
     to the user via sendPhoto, cleaning up the temp file afterward. Any
-    failure here is logged and swallowed - a missing image should never
-    block the text confirmation the user already received."""
+    failure here is logged and swallowed so a card issue never blocks the
+    rest of the trade flow. `reason` is accepted for logging/future use but
+    is not currently rendered on the card itself."""
     trade = {
         "token_name": result["token_name"],
         "token_symbol": result["token_symbol"],
-        "entry_price": result["entry_price"],
-        "exit_price": result["exit_price"],
+        "entry_market_cap": result["entry_market_cap"],
+        "exit_market_cap": result["exit_market_cap"],
         "invested": result["invested"],
         "final_value": result["final_value"],
         "pnl": result["pnl"],
         "pnl_pct": result["pnl_pct"],
         "duration_seconds": _seconds_since(result.get("entry_time")),
-        "reason": reason,
         "logo_url": result.get("logo_url", ""),
     }
 
@@ -673,6 +673,11 @@ async def process_sell(update: Update, target, token_address: str, percent: floa
     sol_price = await market.get_sol_price()
     new_balance_sol = result["new_balance"] / sol_price if sol_price else 0.0
 
+    if result.get("position_closed"):
+        # Full close: the PNL card image is the confirmation, skip the text.
+        await send_pnl_card(telegram_app.bot, update.effective_chat.id, result, reason="manual")
+        return
+
     emoji = "🟢" if result["pnl"] >= 0 else "🔴"
     text = (
         "💸 <b>DEMO SELL EXECUTED</b>\n"
@@ -687,9 +692,6 @@ async def process_sell(update: Update, target, token_address: str, percent: floa
         f"<i>(≈ {fmt_sol(new_balance_sol)})</i>"
     )
     await target.reply_text(text, parse_mode=ParseMode.HTML)
-
-    if result.get("position_closed"):
-        await send_pnl_card(telegram_app.bot, update.effective_chat.id, result, reason="manual")
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -839,31 +841,6 @@ async def check_tp_sl_triggers() -> None:
         except Exception:
             logger.exception("Auto TP/SL sell failed for position %s", pos.get("id"))
             continue
-
-        sol_price = await market.get_sol_price()
-        new_balance_sol = result["new_balance"] / sol_price if sol_price else 0.0
-
-        reason = "🎯 TAKE PROFIT HIT" if hit_tp else "🛑 STOP LOSS HIT"
-        emoji = "🟢" if result["pnl"] >= 0 else "🔴"
-        text = (
-            f"{reason}\n"
-            f"{DIVIDER}\n"
-            f"Token: <b>{html.escape(result['token_name'])}</b> "
-            f"({html.escape(result['token_symbol'])})\n"
-            f"Entry MCap: {fmt_compact(result['entry_market_cap'])}\n"
-            f"Exit MCap: {fmt_compact(result['exit_market_cap'])}\n"
-            f"Received: {fmt_usd(result['proceeds'])}\n"
-            f"{emoji} <b>PNL: {fmt_usd(result['pnl'])} ({result['pnl_pct']:+.2f}%)</b>\n\n"
-            f"💰 Balance: {fmt_usd(result['new_balance'])} "
-            f"<i>(≈ {fmt_sol(new_balance_sol)})</i>\n\n"
-            "🤖 Position auto-closed by your TP/SL order."
-        )
-        try:
-            await telegram_app.bot.send_message(
-                chat_id=user["telegram_id"], text=text, parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            logger.exception("Failed to notify user %s of TP/SL trigger", user.get("telegram_id"))
 
         await send_pnl_card(
             telegram_app.bot,
