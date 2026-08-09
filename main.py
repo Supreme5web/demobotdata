@@ -77,7 +77,7 @@ def fmt_pct(value) -> str:
 
 def pnl_symbol(value) -> str:
     v = float(value or 0)
-    return "▲" if v > 0 else "▼" if v < 0 else "•"
+    return "🟢" if v > 0 else "🔴" if v < 0 else "⚪"
 
 
 def _seconds_since(iso_timestamp) -> float:
@@ -147,24 +147,24 @@ async def balance_block(user: dict) -> str:
     usd_balance = float(user["balance"])
     sol_price = await market.get_sol_price()
     sol_equiv = usd_balance / sol_price if sol_price else 0.0
-    return f"Balance: <b>{fmt_usd(usd_balance)}</b>\n≈ {fmt_sol(sol_equiv)}"
+    return f"💰 Balance: <b>{fmt_usd(usd_balance)}</b>\n≈ {fmt_sol(sol_equiv)}"
 
 
 def tp_sl_line(entry_price: float, entry_mcap: float, tp_price, sl_price) -> str:
     """TP/SL are stored internally as prices (for precise trigger checks)
     but displayed as market cap, in line with the rest of the UI."""
     if not entry_price:
-        return "TP/SL: Not set"
+        return "🎯 TP/SL: Not set"
 
     parts = []
     if tp_price:
         mult = float(tp_price) / entry_price
-        parts.append(f"TP: {fmt_compact(entry_mcap * mult)} ({mult:.1f}x)")
+        parts.append(f"🎯 TP: {fmt_compact(entry_mcap * mult)} ({mult:.1f}x)")
     if sl_price:
         ratio = float(sl_price) / entry_price
-        parts.append(f"SL: {fmt_compact(entry_mcap * ratio)} ({(ratio - 1) * 100:+.1f}%)")
+        parts.append(f"🛑 SL: {fmt_compact(entry_mcap * ratio)} ({(ratio - 1) * 100:+.1f}%)")
     if not parts:
-        return "TP/SL: Not set"
+        return "🎯 TP/SL: Not set"
     return "  |  ".join(parts)
 
 
@@ -189,14 +189,14 @@ def format_position_card(
     entry_mcap = float(entry_market_cap or 0)
 
     return (
-        f"<b>{html.escape(name)}</b> ({html.escape(symbol)})\n\n"
+        f"📌 <b>{html.escape(name)}</b> ({html.escape(symbol)})\n\n"
         f"Entry: <b>{fmt_compact(entry_mcap)}</b>\n"
         f"Current: <b>{fmt_compact(current_market_cap)}</b>\n"
-        f"Invested: {fmt_usd(invested)}\n\n"
+        f"💵 Invested: {fmt_usd(invested)}\n\n"
         f"{tp_sl_line(entry_price, entry_mcap, tp_price, sl_price)}\n\n"
-        f"PNL: <b>{pnl_symbol(pnl)} {fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>\n\n"
-        f"<a href=\"{chart_url}\">View Live Chart</a>\n"
-        f"CA: <code>{html.escape(token_address)}</code>\n"
+        f"{pnl_symbol(pnl)} <b>PNL: {fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>\n\n"
+        f"📈 <a href=\"{chart_url}\">View Live Chart</a>\n"
+        f"<code>{html.escape(token_address)}</code>\n"
         f"<i>Updated {timestamp}</i>"
     )
 
@@ -299,20 +299,20 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = await get_user(update)
     balance_line = await balance_block(user)
     await update.message.reply_text(
-        "<b>PAPERBOAT</b> — Demo Trading Bot\n"
+        "🚤 <b>PAPERBOAT</b> — Demo Trading Bot\n"
         "Practice Solana trading with real market data and zero risk.\n"
         "No wallet. No private keys. No real funds.\n"
         "All trades are simulated with a demo balance.\n\n"
         f"{balance_line}\n\n"
-        "Send any Solana token CA to view live data and trade.\n"
-        "Set Take Profit / Stop Loss and let PaperBoat manage your "
+        "📩 Send any Solana token CA to view live data and trade.\n"
+        "🎯 Set Take Profit / Stop Loss and let PaperBoat manage your "
         "positions automatically.\n\n"
         "<b>Commands:</b>\n"
         "/balance — Check balance\n"
         "/positions — Open positions\n"
         "/history — Trade history\n"
         "/start — Show menu\n\n"
-        "Built by @supremeesol",
+        "🛠 Built by @supremeesol",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -351,7 +351,7 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
 
     overview = (
-        "<b>POSITIONS OVERVIEW</b>\n\n"
+        "📊 <b>POSITIONS OVERVIEW</b>\n\n"
         f"Open Positions: <b>{len(positions)}</b>\n"
         f"Total Invested: {fmt_usd(total_invested)}\n"
         f"Current Value: {fmt_usd(total_value)}\n\n"
@@ -400,12 +400,13 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("No trades yet. Send a token contract address to get started!")
         return
 
-    lines = ["<b>RECENT TRADES</b>", ""]
+    lines = ["📜 <b>RECENT TRADES</b>", ""]
     for t in trades:
         side = t["trade_type"]
+        side_emoji = "🟢" if side == "BUY" else "🔴"
         pnl_str = f" | PNL: {fmt_usd(t['pnl'])}" if side == "SELL" else ""
         lines.append(
-            f"<b>{side}</b> {html.escape(t['token_symbol'])} "
+            f"{side_emoji} <b>{side}</b> {html.escape(t['token_symbol'])} "
             f"— {fmt_usd(t['total_value'])}{pnl_str}"
         )
 
@@ -423,13 +424,14 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 def build_token_info_text(token_data: dict, token_address: str) -> str:
     chart_url = token_chart_url(token_address, token_data.get("dex_url", ""))
     pct_1h = float(token_data.get("price_change_1h") or 0)
+    change_emoji = "📈" if pct_1h >= 0 else "📉"
     return (
-        f"<b>{html.escape(token_data['name'])}</b> ({html.escape(token_data['symbol'])})\n\n"
-        f"MC: <b>{fmt_compact(token_data['market_cap'])}</b>\n"
-        f"24h Vol: {fmt_compact(token_data['volume_24h'])}\n"
-        f"1h: {pct_1h:+.2f}%\n\n"
-        f"CA: <code>{html.escape(token_address)}</code>\n\n"
-        f"<a href=\"{chart_url}\">View Live Chart</a>"
+        f"⚡ <b>{html.escape(token_data['name'])}</b> ({html.escape(token_data['symbol'])})\n\n"
+        f"💰 MC: <b>{fmt_compact(token_data['market_cap'])}</b>\n"
+        f"📊 24h Vol: {fmt_compact(token_data['volume_24h'])}\n"
+        f"{change_emoji} 1h: {pct_1h:+.2f}%\n\n"
+        f"📄 CA: <code>{html.escape(token_address)}</code>\n\n"
+        f"📊 <a href=\"{chart_url}\">View Live Chart</a>"
     )
 
 
@@ -549,7 +551,7 @@ async def process_buy(update: Update, target, token_address: str, sol_amount: fl
 async def process_tp_menu(query, token_address: str) -> None:
     try:
         await query.edit_message_text(
-            "<b>Set Take Profit</b>\n\n"
+            "🎯 <b>Set Take Profit</b>\n\n"
             "Choose a target as a multiple of your entry market cap "
             "(e.g. 2x auto-sells once the cap doubles).",
             parse_mode=ParseMode.HTML,
@@ -564,7 +566,7 @@ async def process_tp_menu(query, token_address: str) -> None:
 async def process_sl_menu(query, token_address: str) -> None:
     try:
         await query.edit_message_text(
-            "<b>Set Stop Loss</b>\n\n"
+            "🛑 <b>Set Stop Loss</b>\n\n"
             "Choose a target as a percent below your entry market cap "
             "(e.g. -20% auto-sells if the cap drops that far).",
             parse_mode=ParseMode.HTML,
@@ -672,7 +674,7 @@ async def process_sell(
 
     if loading_query is not None:
         try:
-            placeholder = "Sending PNL Card..." if percent >= 100 else f"Selling {percent:g}%..."
+            placeholder = "🖼️ Sending PNL Card..." if percent >= 100 else f"⏳ Selling {percent:g}%..."
             await loading_query.edit_message_text(placeholder)
         except BadRequest as exc:
             if "not modified" not in str(exc).lower():
@@ -715,14 +717,14 @@ async def process_sell(
         return
 
     text = (
-        "<b>SELL EXECUTED</b>\n\n"
+        "💸 <b>SELL EXECUTED</b>\n\n"
         f"{html.escape(result['token_name'])} ({html.escape(result['token_symbol'])})\n\n"
         f"Entry MCap: {fmt_compact(result['entry_market_cap'])}\n"
         f"Exit MCap: {fmt_compact(result['exit_market_cap'])}\n"
         f"Received: {fmt_usd(result['proceeds'])}\n\n"
         f"PNL: <b>{pnl_symbol(result['pnl'])} {fmt_usd(result['pnl'])} "
         f"({result['pnl_pct']:+.2f}%)</b>\n\n"
-        f"Balance: {fmt_usd(result['new_balance'])} "
+        f"💰 Balance: {fmt_usd(result['new_balance'])} "
         f"<i>(≈ {fmt_sol(new_balance_sol)})</i>"
     )
     if loading_query is not None:
