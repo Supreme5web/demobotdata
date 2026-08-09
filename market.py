@@ -72,9 +72,12 @@ async def get_token_data(token_address: str) -> Optional[dict]:
     market_cap = _dig(pool, "marketCap.usd", "marketCapUsd", default=0)
     liquidity_usd = _dig(pool, "liquidity.usd", "liquidityUsd", default=0)
 
-    # Volume/price-change live at the top level of the response (per-token,
-    # aggregated across pools), keyed by timeframe.
-    volume_24h = _dig(data, "txns.24h.volume", "volume.24h", default=0)
+    # Volume lives per-pool under `txns` (e.g. pool.txns.volume24h), not at
+    # the top level - that mismatch was why every token showed $0 volume.
+    # Price-change lives at the top level, keyed by timeframe.
+    volume_24h = _dig(pool, "txns.volume24h", "txns.volume", default=0)
+    if not volume_24h:
+        volume_24h = _dig(data, "txns.24h.volume", "volume.24h", default=0)
     price_change_1h = _dig(data, "events.1h.priceChangePercentage", "priceChange.1h", default=0)
 
     return {
