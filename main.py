@@ -151,7 +151,7 @@ def tp_sl_line(entry_price: float, entry_mcap: float, tp_price, sl_price) -> str
     """TP/SL are stored internally as prices (for precise trigger checks)
     but displayed as market cap, in line with the rest of the UI."""
     if not entry_price:
-        return "⚙️ TP/SL: not set"
+        return "🎯 TP/SL: Not set"
 
     parts = []
     if tp_price:
@@ -161,7 +161,7 @@ def tp_sl_line(entry_price: float, entry_mcap: float, tp_price, sl_price) -> str
         ratio = float(sl_price) / entry_price
         parts.append(f"🛑 SL: {fmt_compact(entry_mcap * ratio)} ({(ratio - 1) * 100:+.1f}%)")
     if not parts:
-        return "⚙️ TP/SL: not set"
+        return "🎯 TP/SL: Not set"
     return "  |  ".join(parts)
 
 
@@ -193,17 +193,14 @@ def format_position_card(
     entry_mcap = float(entry_market_cap or 0)
 
     return (
-        f"📌 <b>{html.escape(name)}</b> ({html.escape(symbol)})\n"
-        f"<code>{html.escape(token_address)}</code>\n"
-        f"{DIVIDER}\n"
-        f"Entry MCap: <b>{fmt_compact(entry_mcap)}</b>\n"
-        f"Current MCap: <b>{fmt_compact(current_market_cap)}</b>\n"
-        f"Tokens Held: {tokens:,.0f}\n"
-        f"Invested: {fmt_usd(invested)}\n"
+        f"<b>{html.escape(name)}</b> ({html.escape(symbol)})\n"
+        f"Entry: <b>{fmt_compact(entry_mcap)}</b>\n"
+        f"Current: <b>{fmt_compact(current_market_cap)}</b>\n"
+        f"💵 Invested: {fmt_usd(invested)}\n"
         f"{tp_sl_line(entry_price, entry_mcap, tp_price, sl_price)}\n"
-        f"{DIVIDER}\n"
         f"{emoji} <b>PNL: {fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>\n\n"
-        f"📊 <a href=\"{chart_url}\">View Live Chart</a>\n"
+        f"📈 <a href=\"{chart_url}\">View Live Chart</a>\n"
+        f"<code>{html.escape(token_address)}</code>\n"
         f"<i>Updated {timestamp}</i>"
     )
 
@@ -418,6 +415,11 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"— {fmt_usd(t['total_value'])}{pnl_str}"
         )
 
+    total_pnl = await db.get_total_realized_pnl(user["id"])
+    overall_emoji = "🟢" if total_pnl > 0 else "🔴" if total_pnl < 0 else "⚪"
+    lines.append(DIVIDER)
+    lines.append(f"{overall_emoji} <b>Overall Wallet PNL: {fmt_usd(total_pnl)}</b>")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -427,16 +429,15 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 def build_token_info_text(token_data: dict, token_address: str) -> str:
     chart_url = token_chart_url(token_address, token_data.get("dex_url", ""))
+    pct_1h = float(token_data.get("price_change_1h") or 0)
+    change_emoji = "📈" if pct_1h >= 0 else "📉"
     return (
-        f"⚡ <b>{html.escape(token_data['name'])}</b> "
-        f"(<b>{html.escape(token_data['symbol'])}</b>)\n"
-        f"{DIVIDER}\n"
-        f"📊 Market Cap: <b>{fmt_compact(token_data['market_cap'])}</b>\n"
-        f"📈 Volume (24h): {fmt_compact(token_data['volume_24h'])}\n"
-        f"📉 Change (1h): {fmt_pct(token_data['price_change_1h'])}\n"
-        f"{DIVIDER}\n"
-        f"📄 CA: <code>{html.escape(token_address)}</code>\n\n"
-        f"📊 <a href=\"{chart_url}\">View Live Chart</a>"
+        f"<b>{html.escape(token_data['name'])}</b> ({html.escape(token_data['symbol'])})\n"
+        f"💰 MC: <b>{fmt_compact(token_data['market_cap'])}</b>\n"
+        f"📊 24h Vol: {fmt_compact(token_data['volume_24h'])}\n"
+        f"{change_emoji} 1h: {pct_1h:+.2f}%\n"
+        f"<code>{html.escape(token_address)}</code>\n"
+        f"<a href=\"{chart_url}\">View Live Chart</a>"
     )
 
 
@@ -670,24 +671,56 @@ async def process_back_to_position(query, token_address: str) -> None:
     await query.answer()
 
 
-async def process_sell(update: Update, target, token_address: str, percent: float) -> None:
+async def process_sell(
+    update: Update, target, token_address: str, percent: float, loading_query=None
+) -> None:
+    """Executes a sell. When triggered from a Sell button (`loading_query`
+    set), the originating message is swapped to a "⏳ Selling..." placeholder
+    first so the group sees immediate feedback while the trade + PNL card
+    render, instead of the buttons just sitting there looking unresponsive."""
     user = await get_user(update)
+
+    if loading_query is not None:
+        try:
+            await loading_query.edit_message_text(f"⏳ Selling {percent:g}%...")
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                logger.debug("Could not show sell-loading placeholder", exc_info=True)
+
+    async def _fail(message: str) -> None:
+        if loading_query is not None:
+            try:
+                await loading_query.edit_message_text(message)
+                return
+            except BadRequest:
+                pass
+        await target.reply_text(message)
+
     try:
         result = await trading.execute_sell(user, token_address, percent)
     except trading.TradingError as exc:
-        await target.reply_text(f"⚠️ {exc}")
+        await _fail(f"⚠️ {exc}")
         return
     except Exception:
         logger.exception("Unexpected error during sell")
-        await target.reply_text("⚠️ Something went wrong processing that trade. Please try again.")
+        await _fail("⚠️ Something went wrong processing that trade. Please try again.")
         return
 
     sol_price = await market.get_sol_price()
     new_balance_sol = result["new_balance"] / sol_price if sol_price else 0.0
 
     if result.get("position_closed"):
-        # Full close: the PNL card image is the confirmation, skip the text.
+        # Full close: the PNL card image is the confirmation. Drop it in the
+        # chat, then remove the loading placeholder now that it's served its purpose.
         await send_pnl_card(telegram_app.bot, update.effective_chat.id, result, reason="manual")
+        if loading_query is not None:
+            try:
+                await telegram_app.bot.delete_message(
+                    chat_id=loading_query.message.chat_id,
+                    message_id=loading_query.message.message_id,
+                )
+            except Exception:
+                logger.debug("Could not delete sell-loading placeholder", exc_info=True)
         return
 
     emoji = "🟢" if result["pnl"] >= 0 else "🔴"
@@ -703,6 +736,14 @@ async def process_sell(update: Update, target, token_address: str, percent: floa
         f"💰 Balance: {fmt_usd(result['new_balance'])} "
         f"<i>(≈ {fmt_sol(new_balance_sol)})</i>"
     )
+    if loading_query is not None:
+        try:
+            await loading_query.edit_message_text(text, parse_mode=ParseMode.HTML)
+            return
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+            return
     await target.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -804,7 +845,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     elif action == "sell" and len(parts) == 3:
         await query.answer()
         token_address, percent_str = parts[1], parts[2]
-        await process_sell(update, query.message, token_address, float(percent_str))
+        await process_sell(
+            update, query.message, token_address, float(percent_str), loading_query=query
+        )
     elif action == "refresh" and len(parts) == 2:
         await process_refresh(query, parts[1])
     elif action == "refreshtoken" and len(parts) == 2:

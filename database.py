@@ -169,3 +169,19 @@ async def get_trades(user_id: str, limit: int = 10) -> list:
         return res.data or []
 
     return await _run(_op)
+
+
+async def get_total_realized_pnl(user_id: str) -> float:
+    """Sums PNL across every SELL trade the user has ever made (all-time,
+    not limited by the /history display cap)."""
+    def _op():
+        res = (
+            supabase.table("trades")
+            .select("pnl")
+            .eq("user_id", user_id)
+            .eq("trade_type", "SELL")
+            .execute()
+        )
+        return sum(float(row.get("pnl") or 0) for row in (res.data or []))
+
+    return await _run(_op)
