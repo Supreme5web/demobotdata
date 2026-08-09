@@ -10,7 +10,8 @@ from typing import Optional
 
 from supabase import create_client, Client
 
-from config import SUPABASE_URL, SUPABASE_KEY, STARTING_BALANCE
+import market
+from config import SUPABASE_URL, SUPABASE_KEY, STARTING_BALANCE_SOL
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ async def _run(fn, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 async def get_or_create_user(telegram_id: int, username: Optional[str]) -> dict:
-    def _op():
+    def _lookup():
         res = (
             supabase.table("users")
             .select("*")
@@ -34,19 +35,31 @@ async def get_or_create_user(telegram_id: int, username: Optional[str]) -> dict:
             .limit(1)
             .execute()
         )
-        if res.data:
-            return res.data[0]
+        return res.data[0] if res.data else None
 
+    existing = await _run(_lookup)
+    if existing:
+        return existing
+
+    # New user: seed their demo balance with the USD value of
+    # STARTING_BALANCE_SOL at the current live SOL price.
+    sol_price = await market.get_sol_price()
+    starting_balance = STARTING_BALANCE_SOL * sol_price
+
+    def _insert():
         new_user = {
             "telegram_id": telegram_id,
             "username": username or "",
-            "balance": STARTING_BALANCE,
+            "balance": starting_balance,
         }
         insert_res = supabase.table("users").insert(new_user).execute()
-        logger.info("Created new user for telegram_id=%s", telegram_id)
+        logger.info(
+            "Created new user for telegram_id=%s with starting balance $%.2f (%.2f SOL @ $%.2f)",
+            telegram_id, starting_balance, STARTING_BALANCE_SOL, sol_price,
+        )
         return insert_res.data[0]
 
-    return await _run(_op)
+    return await _run(_insert)
 
 
 async def update_balance(user_id: str, new_balance: float) -> None:

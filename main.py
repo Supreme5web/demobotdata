@@ -463,7 +463,7 @@ async def show_token_info(update: Update, token_address: str) -> None:
     token_data = await market.get_token_data(token_address)
     if not token_data:
         await update.message.reply_text(
-            "⚠️ Couldn't find that token on DexScreener. Double check the contract address."
+            "⚠️ Couldn't find that token. Double check the contract address."
         )
         return
 
@@ -501,7 +501,8 @@ async def process_refresh_token(query, token_address: str) -> None:
     await query.answer("Updated")
 
 
-async def process_buy(update: Update, target, token_address: str, sol_amount: float) -> None:
+async def process_buy(update: Update, target, token_address: str, sol_amount: float,
+                       delete_chat_id=None, delete_message_id=None) -> None:
     user = await get_user(update)
     try:
         result = await trading.execute_buy(user, token_address, sol_amount)
@@ -539,6 +540,17 @@ async def process_buy(update: Update, target, token_address: str, sol_amount: fl
         reply_markup=build_position_keyboard(token_address),
         disable_web_page_preview=True,
     )
+
+    # Clean up the original "Buy" prompt (token card with buy buttons, or the
+    # "send a custom amount" message) now that the trade confirmation is shown.
+    if delete_chat_id is not None and delete_message_id is not None:
+        try:
+            await telegram_app.bot.delete_message(chat_id=delete_chat_id, message_id=delete_message_id)
+        except Exception:
+            logger.debug(
+                "Could not delete origin buy message %s in chat %s",
+                delete_message_id, delete_chat_id, exc_info=True,
+            )
 
 
 async def process_tp_menu(query, token_address: str) -> None:
@@ -700,12 +712,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     pending_ca = context.user_data.get("awaiting_custom_buy")
     if pending_ca:
         context.user_data.pop("awaiting_custom_buy", None)
+        origin = context.user_data.pop("awaiting_custom_buy_origin", None)
         try:
             amount = float(text)
         except ValueError:
             await update.message.reply_text("Please send a valid number, e.g. 0.75")
             return
-        await process_buy(update, update.message, pending_ca, amount)
+        await process_buy(
+            update, update.message, pending_ca, amount,
+            delete_chat_id=origin.get("chat_id") if origin else None,
+            delete_message_id=origin.get("message_id") if origin else None,
+        )
         return
 
     pending_tp = context.user_data.get("awaiting_custom_tp")
@@ -770,11 +787,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if action == "buy" and len(parts) == 3:
         await query.answer()
         token_address, amount_str = parts[1], parts[2]
-        await process_buy(update, query.message, token_address, float(amount_str))
+        await process_buy(
+            update, query.message, token_address, float(amount_str),
+            delete_chat_id=query.message.chat_id,
+            delete_message_id=query.message.message_id,
+        )
     elif action == "buycustom" and len(parts) == 2:
         await query.answer()
         token_address = parts[1]
         context.user_data["awaiting_custom_buy"] = token_address
+        context.user_data["awaiting_custom_buy_origin"] = {
+            "chat_id": query.message.chat_id,
+            "message_id": query.message.message_id,
+        }
         await query.message.reply_text("Send the amount of SOL you'd like to spend, e.g. 0.75")
     elif action == "sell" and len(parts) == 3:
         await query.answer()
