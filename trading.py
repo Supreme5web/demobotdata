@@ -85,6 +85,14 @@ async def execute_buy(user: dict, token_address: str, usdc_amount: float, chain:
         total_invested = new_invested
         is_dca = True
     else:
+        # Apply the user's /settings auto TP/SL defaults (if any) to a
+        # brand-new position only - DCA buys above keep whatever TP/SL was
+        # already set on the existing position untouched.
+        default_tp_mult = user.get("default_tp_multiple")
+        default_sl_pct = user.get("default_sl_percent")
+        default_tp_price = entry_price * float(default_tp_mult) if default_tp_mult else None
+        default_sl_price = entry_price * (1 - float(default_sl_pct) / 100) if default_sl_pct else None
+
         await db.create_position(
             {
                 "user_id": user["id"],
@@ -99,6 +107,8 @@ async def execute_buy(user: dict, token_address: str, usdc_amount: float, chain:
                 "current_price": entry_price,
                 "current_market_cap": entry_market_cap,
                 "unrealized_pnl": 0,
+                "tp_price": default_tp_price,
+                "sl_price": default_sl_price,
             }
         )
         avg_entry_price = entry_price
@@ -219,6 +229,7 @@ async def execute_sell(user: dict, token_address: str, percent: float, chain: st
         "position_closed": position_closed,
         "entry_time": position.get("created_at"),
         "logo_url": token_data.get("logo_url", ""),
+        "username": user.get("username") or "",
     }
 
 

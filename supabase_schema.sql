@@ -61,3 +61,9 @@ create unique index if not exists idx_positions_user_token_chain
 
 create index if not exists idx_positions_user_id on positions(user_id);
 create index if not exists idx_trades_user_id on trades(user_id);
+
+-- Safe to re-run: adds /settings support (custom buy buttons + auto TP/SL
+-- defaults applied to new positions). NULL means "use the app default".
+alter table if exists users add column if not exists buy_presets jsonb;
+alter table if exists users add column if not exists default_tp_multiple numeric;
+alter table if exists users add column if not exists default_sl_percent numeric;

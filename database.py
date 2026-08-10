@@ -66,6 +66,15 @@ async def update_balance(user_id: str, new_balance: float) -> None:
     await _run(_op)
 
 
+async def update_user_settings(user_id: str, fields: dict) -> None:
+    """Persists /settings changes: buy_presets (list) and/or
+    default_tp_multiple / default_sl_percent (numeric or None to clear)."""
+    def _op():
+        supabase.table("users").update(fields).eq("id", user_id).execute()
+
+    await _run(_op)
+
+
 async def get_user_by_id(user_id: str) -> Optional[dict]:
     def _op():
         res = supabase.table("users").select("*").eq("id", user_id).limit(1).execute()

@@ -78,6 +78,28 @@ TP_PRESETS = [2, 3, 5, 10]
 # Stop-loss presets, expressed as percent below entry market cap.
 SL_PRESETS = [10, 20, 30, 50]
 
+# Set once at startup (see lifespan()) - used to build the "Send PNL Card"
+# deep link (t.me/<bot>?start=pnl_<chain>_<address>) on position cards.
+BOT_USERNAME: str = ""
+
+
+def get_buy_presets(user: Optional[dict], chain: str) -> list:
+    """A user's /settings buy_presets override the chain's default preset
+    amounts when set; otherwise falls back to config's defaults."""
+    custom = user.get("buy_presets") if user else None
+    if custom:
+        return custom
+    return CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
+
+
+def pnl_share_link(token_address: str, chain: str) -> str:
+    """Deep link that re-opens the bot and triggers a live PNL card for this
+    position, via start_handler's payload parsing. Empty until BOT_USERNAME
+    is set (right after startup)."""
+    if not BOT_USERNAME:
+        return ""
+    return f"https://t.me/{BOT_USERNAME}?start=pnl_{chain}_{token_address}"
+
 
 # ---------------------------------------------------------------------------
 # Formatting helpers
@@ -129,12 +151,16 @@ def _seconds_since(iso_timestamp) -> float:
         return 0.0
 
 
-async def send_pnl_card(bot, chat_id: int, result: dict, reason: str) -> None:
-    """Renders a PaperBoat PNL card for a just-closed position and sends it
-    to the user via sendPhoto, cleaning up the temp file afterward. Any
-    failure here is logged and swallowed so a card issue never blocks the
-    rest of the trade flow. `reason` is accepted for logging/future use but
-    is not currently rendered on the card itself."""
+async def send_pnl_card(
+    bot, chat_id: int, result: dict, reason: str, username: str = "", status_label: str = "TRADE CLOSED"
+) -> None:
+    """Renders a PaperBoat PNL card and sends it to the user via sendPhoto,
+    cleaning up the temp file afterward. Any failure here is logged and
+    swallowed so a card issue never blocks the rest of the trade flow.
+    `reason` is accepted for logging/future use but is not currently
+    rendered on the card itself. `status_label` distinguishes a closed
+    trade ("TRADE CLOSED") from a live share of an open position
+    ("CURRENT PNL", via the Send PNL Card link)."""
     trade = {
         "token_name": result["token_name"],
         "token_symbol": result["token_symbol"],
@@ -146,6 +172,8 @@ async def send_pnl_card(bot, chat_id: int, result: dict, reason: str) -> None:
         "pnl_pct": result["pnl_pct"],
         "duration_seconds": _seconds_since(result.get("entry_time")),
         "logo_url": result.get("logo_url", ""),
+        "username": username,
+        "status_label": status_label,
     }
 
     path = None
@@ -175,6 +203,11 @@ def token_chart_url(token_address: str, chain: str, fallback: str = "") -> str:
 
 async def get_user(update: Update) -> dict:
     tg_user = update.effective_user
+    return await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+
+
+async def get_or_create_from_query(query) -> dict:
+    tg_user = query.from_user
     return await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
 
 
@@ -232,21 +265,28 @@ def format_position_card(
         f"{tp_sl_line(entry_price, entry_mcap, tp_price, sl_price)}\n\n"
         f"{pnl_symbol(pnl)} <b>PNL: {fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>\n\n"
         f"📈 <a href=\"{chart_url}\">View Live Chart</a>\n"
+        f"{_pnl_share_line(token_address, chain)}"
         f"<code>{html.escape(token_address)}</code>\n"
         f"<i>Updated {timestamp}</i>"
     )
 
 
-def build_position_keyboard(token_address: str, chain: str) -> InlineKeyboardMarkup:
+def _pnl_share_line(token_address: str, chain: str) -> str:
+    link = pnl_share_link(token_address, chain)
+    return f"📤 <a href=\"{link}\">Send PNL Card</a>\n" if link else ""
+
+
+def build_position_keyboard(token_address: str, chain: str, buy_presets: Optional[list] = None) -> InlineKeyboardMarkup:
     """Buy (DCA) buttons sit above the sell buttons - buying more of a
     position the user already holds is at least as common an action as
     selling it, and putting it first keeps DCA one tap away instead of
-    burying it back on the token-info card."""
-    presets = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
+    burying it back on the token-info card. `buy_presets` lets a caller pass
+    the user's /settings-customized amounts; falls back to the chain default."""
+    presets = buy_presets or CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
     buy_rows = [
         [
             InlineKeyboardButton(
-                f"➕ Buy ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}"
+                f"🟢 Buy ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}"
             )
             for amt in presets[i : i + 2]
         ]
@@ -262,8 +302,8 @@ def build_position_keyboard(token_address: str, chain: str) -> InlineKeyboardMar
                 InlineKeyboardButton("🛑 Set SL", callback_data=f"slmenu:{chain}:{token_address}"),
             ],
             [
-                InlineKeyboardButton("💸 Sell 50%", callback_data=f"sell:{chain}:{token_address}:50"),
-                InlineKeyboardButton("💯 Sell 100%", callback_data=f"sell:{chain}:{token_address}:100"),
+                InlineKeyboardButton("🔴 Sell 50%", callback_data=f"sell:{chain}:{token_address}:50"),
+                InlineKeyboardButton("🔴 Sell 100%", callback_data=f"sell:{chain}:{token_address}:100"),
             ],
             [InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address, chain))],
         ]
@@ -308,6 +348,7 @@ async def render_position_card(user_id: str, token_address: str, chain: str, liv
     position = await db.get_position(user_id, token_address, chain)
     if not position:
         return None
+    user = await db.get_user_by_id(user_id)
 
     entry_price = float(position["entry_price"])
     entry_mcap = float(position.get("entry_market_cap") or 0)
@@ -341,14 +382,71 @@ async def render_position_card(user_id: str, token_address: str, chain: str, liv
         tp_price=position.get("tp_price"),
         sl_price=position.get("sl_price"),
     )
-    return text, build_position_keyboard(token_address, chain)
+    return text, build_position_keyboard(token_address, chain, get_buy_presets(user, chain))
 
 
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
+async def handle_pnl_share_link(update: Update, payload: str) -> None:
+    """Handles the /start deep link behind the "Send PNL Card" text link on
+    a position card (t.me/<bot>?start=pnl_<chain>_<address>) - renders a
+    live, still-open PNL card the user can forward/share."""
+    try:
+        _, chain, token_address = payload.split("_", 2)
+    except ValueError:
+        return
+
+    user = await get_user(update)
+    position = await db.get_position(user["id"], token_address, chain)
+    if not position:
+        await update.message.reply_text("⚠️ You don't have an open position in this token anymore.")
+        return
+
+    token_data = await market.get_token_data(token_address, chain)
+    entry_price = float(position["entry_price"])
+    entry_mcap = float(position.get("entry_market_cap") or 0)
+    amount = float(position["amount"])
+    invested = float(position["invested_amount"])
+
+    if token_data and token_data.get("price_usd"):
+        current_price = float(token_data["price_usd"])
+        current_mcap = float(token_data.get("market_cap") or 0)
+    else:
+        current_price = float(position.get("current_price") or entry_price)
+        current_mcap = float(position.get("current_market_cap") or entry_mcap)
+
+    current_value = amount * current_price
+    pnl = current_value - invested
+    pnl_pct = (pnl / invested * 100) if invested else 0.0
+
+    tg_user = update.effective_user
+    username = f"@{tg_user.username}" if tg_user.username else (tg_user.first_name or "")
+
+    result = {
+        "token_name": position["token_name"],
+        "token_symbol": position["token_symbol"],
+        "entry_market_cap": entry_mcap,
+        "exit_market_cap": current_mcap,
+        "invested": invested,
+        "final_value": current_value,
+        "pnl": pnl,
+        "pnl_pct": pnl_pct,
+        "entry_time": position.get("created_at"),
+        "logo_url": token_data.get("logo_url", "") if token_data else "",
+    }
+    await send_pnl_card(
+        telegram_app.bot, update.effective_chat.id, result, reason="live",
+        username=username, status_label="CURRENT PNL",
+    )
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.args and context.args[0].startswith("pnl_"):
+        await handle_pnl_share_link(update, context.args[0])
+        return
+
     user = await get_user(update)
     balance_line = await balance_block(user)
     await update.message.reply_text(
@@ -372,6 +470,45 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "🛠 Built by @supremeesol",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
+    )
+
+
+def build_settings_text(user: dict) -> str:
+    presets = user.get("buy_presets") or config.USDC_BUY_PRESETS
+    presets_str = ", ".join(f"${p:g}" for p in presets)
+    tp = user.get("default_tp_multiple")
+    sl = user.get("default_sl_percent")
+    tp_str = f"{float(tp):g}x" if tp else "Off"
+    sl_str = f"-{float(sl):g}%" if sl else "Off"
+    return (
+        "⚙️ <b>SETTINGS</b>\n\n"
+        f"🟢 Buy Buttons: <b>{presets_str}</b>\n"
+        f"🎯 Default TP: <b>{tp_str}</b>\n"
+        f"🛑 Default SL: <b>{sl_str}</b>\n\n"
+        "Default TP/SL auto-apply the moment you open a brand-new position."
+    )
+
+
+def build_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ Edit Buy Buttons", callback_data="stgbuy")],
+            [
+                InlineKeyboardButton("🎯 Set Default TP", callback_data="stgtp"),
+                InlineKeyboardButton("❌ Clear TP", callback_data="stgtpclear"),
+            ],
+            [
+                InlineKeyboardButton("🛑 Set Default SL", callback_data="stgsl"),
+                InlineKeyboardButton("❌ Clear SL", callback_data="stgslclear"),
+            ],
+        ]
+    )
+
+
+async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await get_user(update)
+    await update.message.reply_text(
+        build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
     )
 
 
@@ -446,7 +583,7 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=build_position_keyboard(pos["token_address"], chain),
+            reply_markup=build_position_keyboard(pos["token_address"], chain, get_buy_presets(user, chain)),
             disable_web_page_preview=True,
         )
 
@@ -496,11 +633,13 @@ def build_token_info_text(token_data: dict, token_address: str, chain: str) -> s
     )
 
 
-def build_token_info_keyboard(token_address: str, chain: str, dex_url: str = "") -> InlineKeyboardMarkup:
-    presets = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
+def build_token_info_keyboard(
+    token_address: str, chain: str, dex_url: str = "", buy_presets: Optional[list] = None
+) -> InlineKeyboardMarkup:
+    presets = buy_presets or CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
     keyboard = [
         [
-            InlineKeyboardButton(f"BUY ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}")
+            InlineKeyboardButton(f"🟢 BUY ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}")
             for amt in presets[i : i + 2]
         ]
         for i in range(0, len(presets), 2)
@@ -526,8 +665,13 @@ async def show_token_info(target, token_address: str, chain: str, token_data: Op
         )
         return
 
+    tg_user = target.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+
     text = build_token_info_text(token_data, token_address, chain)
-    keyboard = build_token_info_keyboard(token_address, chain, token_data.get("dex_url", ""))
+    keyboard = build_token_info_keyboard(
+        token_address, chain, token_data.get("dex_url", ""), get_buy_presets(user, chain)
+    )
 
     await target.reply_text(
         text,
@@ -543,8 +687,13 @@ async def process_refresh_token(query, chain: str, token_address: str) -> None:
         await query.answer("Couldn't fetch live data right now. Try again shortly.", show_alert=True)
         return
 
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+
     text = build_token_info_text(token_data, token_address, chain)
-    keyboard = build_token_info_keyboard(token_address, chain, token_data.get("dex_url", ""))
+    keyboard = build_token_info_keyboard(
+        token_address, chain, token_data.get("dex_url", ""), get_buy_presets(user, chain)
+    )
 
     try:
         await query.edit_message_text(
@@ -597,7 +746,7 @@ async def process_buy(update: Update, target, token_address: str, usdc_amount: f
     await target.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=build_position_keyboard(token_address, chain),
+        reply_markup=build_position_keyboard(token_address, chain, get_buy_presets(user, chain)),
         disable_web_page_preview=True,
     )
 
@@ -767,7 +916,10 @@ async def process_sell(
     if result.get("position_closed"):
         # Full close: the PNL card image is the confirmation. Drop it in the
         # chat, then remove the loading placeholder now that it's served its purpose.
-        await send_pnl_card(telegram_app.bot, update.effective_chat.id, result, reason="manual")
+        await send_pnl_card(
+            telegram_app.bot, update.effective_chat.id, result, reason="manual",
+            username=result.get("username", ""),
+        )
         if loading_query is not None:
             try:
                 await telegram_app.bot.delete_message(
@@ -864,6 +1016,57 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         return
 
+    if context.user_data.get("awaiting_settings_buy"):
+        context.user_data.pop("awaiting_settings_buy", None)
+        try:
+            presets = [float(p.strip()) for p in text.split(",") if p.strip()]
+            if not presets or any(p <= 0 for p in presets):
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please send valid comma-separated numbers, e.g. 50,100,250,500")
+            return
+        user = await get_user(update)
+        await db.update_user_settings(user["id"], {"buy_presets": presets})
+        user["buy_presets"] = presets
+        await update.message.reply_text(
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+        )
+        return
+
+    if context.user_data.get("awaiting_settings_tp"):
+        context.user_data.pop("awaiting_settings_tp", None)
+        try:
+            multiple = float(text)
+            if multiple <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please send a valid multiple, e.g. 3 for 3x")
+            return
+        user = await get_user(update)
+        await db.update_user_settings(user["id"], {"default_tp_multiple": multiple})
+        user["default_tp_multiple"] = multiple
+        await update.message.reply_text(
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+        )
+        return
+
+    if context.user_data.get("awaiting_settings_sl"):
+        context.user_data.pop("awaiting_settings_sl", None)
+        try:
+            percent = float(text)
+            if percent <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please send a valid percent, e.g. 20 for -20%")
+            return
+        user = await get_user(update)
+        await db.update_user_settings(user["id"], {"default_sl_percent": percent})
+        user["default_sl_percent"] = percent
+        await update.message.reply_text(
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+        )
+        return
+
     if SOLANA_CA_REGEX.match(text) or EVM_CA_REGEX.match(text):
         chain, token_data = await resolve_chain(text)
         if chain:
@@ -929,6 +1132,34 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.message.reply_text("Send your SL as a percent below entry market cap, e.g. 25 for -25%")
     elif action == "backpos" and len(parts) == 3:
         await process_back_to_position(query, parts[1], parts[2])
+    elif action == "stgbuy":
+        await query.answer()
+        context.user_data["awaiting_settings_buy"] = True
+        await query.message.reply_text("Send 4 comma-separated USDC amounts, e.g. 50,100,250,500")
+    elif action == "stgtp":
+        await query.answer()
+        context.user_data["awaiting_settings_tp"] = True
+        await query.message.reply_text("Send your default TP as a multiple of entry market cap, e.g. 3 for 3x")
+    elif action == "stgsl":
+        await query.answer()
+        context.user_data["awaiting_settings_sl"] = True
+        await query.message.reply_text("Send your default SL as a percent below entry market cap, e.g. 20 for -20%")
+    elif action == "stgtpclear":
+        user = await get_or_create_from_query(query)
+        await db.update_user_settings(user["id"], {"default_tp_multiple": None})
+        user["default_tp_multiple"] = None
+        await query.edit_message_text(
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+        )
+        await query.answer("Default TP cleared")
+    elif action == "stgslclear":
+        user = await get_or_create_from_query(query)
+        await db.update_user_settings(user["id"], {"default_sl_percent": None})
+        user["default_sl_percent"] = None
+        await query.edit_message_text(
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+        )
+        await query.answer("Default SL cleared")
     else:
         await query.answer()
 
@@ -975,6 +1206,7 @@ async def check_tp_sl_triggers() -> None:
             user["telegram_id"],
             result,
             reason="tp" if hit_tp else "sl",
+            username=result.get("username", ""),
         )
 
 
@@ -988,6 +1220,7 @@ telegram_app.add_handler(CommandHandler("start", start_handler))
 telegram_app.add_handler(CommandHandler("balance", balance_handler))
 telegram_app.add_handler(CommandHandler("positions", positions_handler))
 telegram_app.add_handler(CommandHandler("history", history_handler))
+telegram_app.add_handler(CommandHandler("settings", settings_handler))
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
@@ -996,6 +1229,7 @@ BOT_COMMANDS = [
     BotCommand("balance", "Check your demo balance"),
     BotCommand("positions", "View your open positions"),
     BotCommand("history", "View your recent trades"),
+    BotCommand("settings", "Customize buy buttons & default TP/SL"),
 ]
 
 
@@ -1017,7 +1251,9 @@ async def price_update_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global BOT_USERNAME
     await telegram_app.initialize()
+    BOT_USERNAME = telegram_app.bot.username
     await telegram_app.bot.set_my_commands(BOT_COMMANDS)
     await telegram_app.start()
     await telegram_app.updater.start_polling(drop_pending_updates=True)

@@ -219,7 +219,9 @@ def generate_pnl_card(trade: dict) -> str:
     Expected keys in `trade`:
         token_name, token_symbol, entry_market_cap, exit_market_cap,
         invested, final_value, pnl, pnl_pct, duration_seconds,
-        logo_url (optional)
+        logo_url (optional), username (optional), status_label (optional,
+        defaults to "TRADE CLOSED" - e.g. pass "CURRENT PNL" for a live,
+        still-open position shared via the Send PNL Card link).
     """
     base = Image.open(TEMPLATE_PATH).convert("RGBA")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -241,7 +243,14 @@ def generate_pnl_card(trade: dict) -> str:
     y = 55
     draw_text_with_emoji(overlay, (x, y), "🚤 PAPERBOAT", _font(FONT_BOLD, 30), CYAN, emoji_px=32)
     y += 44
-    draw.text((x, y), "TRADE CLOSED", font=header_font, fill=WHITE)
+    status_label = trade.get("status_label") or "TRADE CLOSED"
+    draw.text((x, y), status_label, font=header_font, fill=WHITE)
+
+    username = trade.get("username")
+    if username:
+        y += 34
+        handle = username if str(username).startswith("@") else f"@{username}"
+        draw.text((x, y), handle, font=_font(FONT_REGULAR, 24), fill=LABEL_GRAY)
 
     # --- Token identity (logo + name/symbol) -------------------------------
     y += 70
