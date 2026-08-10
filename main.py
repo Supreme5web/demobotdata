@@ -1,8 +1,7 @@
 """Telegram bot + FastAPI server for PaperBoat - Demo Trading Bot.
 
 No wallets, no private keys, no real transactions - everything here trades
-against a virtual USD balance stored in Supabase. Supports Solana,
-Ethereum, BNB Chain, and Robinhood Chain.
+against a virtual USD balance stored in Supabase. Solana only.
 """
 
 import asyncio
@@ -41,14 +40,6 @@ logger = logging.getLogger(__name__)
 
 # Base58, 32-44 chars - matches typical Solana addresses.
 SOLANA_CA_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
-# 0x + 40 hex chars - matches Ethereum, BNB Chain, and Robinhood Chain
-# addresses alike, since they're all EVM chains. The address format alone
-# can't tell them apart, so an EVM-shaped address triggers a chain picker
-# (see show_chain_picker) instead of going straight to show_token_info.
-EVM_CA_REGEX = re.compile(r"^0x[a-fA-F0-9]{40}$")
-
-# EVM chains offered in the chain picker, in display order.
-EVM_CHAINS = ["eth", "bsc", "rbh"]
 
 # Take-profit presets, expressed as a multiple of entry market cap (e.g. "2" = 2x).
 TP_PRESETS = [2, 3, 5, 10]
@@ -291,23 +282,6 @@ def build_sl_menu_keyboard(token_address: str, chain: str) -> InlineKeyboardMark
     return InlineKeyboardMarkup(rows)
 
 
-def build_chain_picker_keyboard(token_address: str) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(chain_label(c), callback_data=f"pickchain:{token_address}:{c}")]
-        for c in EVM_CHAINS
-    ]
-    return InlineKeyboardMarkup(rows)
-
-
-async def show_chain_picker(target, token_address: str) -> None:
-    """EVM addresses are ambiguous across Ethereum / BNB Chain / Robinhood
-    Chain, so ask which one before fetching any market data."""
-    await target.reply_text(
-        "That looks like an EVM address - which chain is it on?",
-        reply_markup=build_chain_picker_keyboard(token_address),
-    )
-
-
 async def render_position_card(user_id: str, token_address: str, chain: str, live: bool = True):
     """Builds the (text, keyboard) pair for a position card. Returns None if
     the position no longer exists. `live=False` reuses the last-known
@@ -359,17 +333,14 @@ async def render_position_card(user_id: str, token_address: str, chain: str, liv
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await get_user(update)
     balance_line = await balance_block(user)
-    chains_line = " / ".join(chain_label(c) for c in [DEFAULT_CHAIN, *EVM_CHAINS])
     await update.message.reply_text(
         "🚤 <b>PAPERBOAT</b> — Demo Trading Bot\n"
         "Practice trading with real market data and zero risk.\n"
         "No wallet. No private keys. No real funds.\n"
         "All trades are simulated with a demo balance.\n\n"
-        f"⛓ Chains: {chains_line}\n\n"
+        f"⛓ Chain: {chain_label(DEFAULT_CHAIN)}\n\n"
         f"{balance_line}\n\n"
-        "📩 Send any token contract address to view live data and trade.\n"
-        "Solana addresses are detected automatically; for Ethereum / BNB "
-        "Chain / Robinhood Chain addresses I'll ask which chain it's on.\n"
+        "📩 Send a Solana token contract address to view live data and trade.\n"
         "➕ Already holding a token? Tap Buy again on its position card to "
         "DCA in - your average entry updates automatically.\n"
         "🎯 Set Take Profit / Stop Loss and let PaperBoat manage your "
@@ -544,30 +515,6 @@ async def show_token_info(target, token_address: str, chain: str) -> None:
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
-
-
-async def process_pick_chain(query, token_address: str, chain: str) -> None:
-    """User picked which EVM chain their pasted address is on."""
-    token_data = await market.get_token_data(token_address, chain)
-    if not token_data:
-        await query.answer(
-            f"Couldn't find that token on {chain_label(chain)}.", show_alert=True
-        )
-        return
-
-    text = build_token_info_text(token_data, token_address, chain)
-    keyboard = build_token_info_keyboard(token_address, chain, token_data.get("dex_url", ""))
-    try:
-        await query.edit_message_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-    except BadRequest as exc:
-        if "not modified" not in str(exc).lower():
-            raise
-    await query.answer()
 
 
 async def process_refresh_token(query, chain: str, token_address: str) -> None:
@@ -911,8 +858,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if SOLANA_CA_REGEX.match(text):
         await show_token_info(update.message, text, "sol")
-    elif EVM_CA_REGEX.match(text):
-        await show_chain_picker(update.message, text)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -970,8 +915,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.message.reply_text("Send your SL as a percent below entry market cap, e.g. 25 for -25%")
     elif action == "backpos" and len(parts) == 3:
         await process_back_to_position(query, parts[1], parts[2])
-    elif action == "pickchain" and len(parts) == 3:
-        await process_pick_chain(query, parts[1], parts[2])
     else:
         await query.answer()
 
