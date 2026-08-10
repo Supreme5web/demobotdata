@@ -1,7 +1,8 @@
 """Telegram bot + FastAPI server for PaperBoat - Demo Trading Bot.
 
 No wallets, no private keys, no real transactions - everything here trades
-against a virtual USD balance stored in Supabase.
+against a virtual USD balance stored in Supabase. Supports Solana,
+Ethereum, BNB Chain, and Robinhood Chain.
 """
 
 import asyncio
@@ -30,6 +31,7 @@ import database as db
 import market
 import pnl_card
 import trading
+from config import CHAINS, DEFAULT_CHAIN
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +41,14 @@ logger = logging.getLogger(__name__)
 
 # Base58, 32-44 chars - matches typical Solana addresses.
 SOLANA_CA_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+# 0x + 40 hex chars - matches Ethereum, BNB Chain, and Robinhood Chain
+# addresses alike, since they're all EVM chains. The address format alone
+# can't tell them apart, so an EVM-shaped address triggers a chain picker
+# (see show_chain_picker) instead of going straight to show_token_info.
+EVM_CA_REGEX = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+# EVM chains offered in the chain picker, in display order.
+EVM_CHAINS = ["eth", "bsc", "rbh"]
 
 # Take-profit presets, expressed as a multiple of entry market cap (e.g. "2" = 2x).
 TP_PRESETS = [2, 3, 5, 10]
@@ -54,8 +64,17 @@ def fmt_usd(value) -> str:
     return f"${float(value or 0):,.2f}"
 
 
+def fmt_native(value, chain: str) -> str:
+    symbol = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["native_symbol"]
+    return f"{float(value or 0):,.4f} {symbol}"
+
+
 def fmt_sol(value) -> str:
-    return f"{float(value or 0):,.4f} SOL"
+    return fmt_native(value, "sol")
+
+
+def chain_label(chain: str) -> str:
+    return CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["label"]
 
 
 def fmt_compact(value) -> str:
@@ -130,11 +149,14 @@ async def send_pnl_card(bot, chat_id: int, result: dict, reason: str) -> None:
                 logger.warning("Could not delete temp PNL card file %s", path)
 
 
-def token_chart_url(token_address: str, fallback: str = "") -> str:
+def token_chart_url(token_address: str, chain: str, fallback: str = "") -> str:
     """Best-effort live chart link. Prefers an exact pair/pool URL from the
-    API response when available; falls back to the generic Solana Tracker
-    token page."""
-    return fallback or f"https://www.solanatracker.io/token/{token_address}"
+    API response when available; falls back to the chain's generic explorer
+    page template."""
+    if fallback:
+        return fallback
+    cfg = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])
+    return cfg["explorer_url"].format(address=token_address)
 
 
 async def get_user(update: Update) -> dict:
@@ -143,7 +165,9 @@ async def get_user(update: Update) -> dict:
 
 
 async def balance_block(user: dict) -> str:
-    """Renders the demo balance in both USD and its live SOL equivalent."""
+    """Renders the demo balance in both USD and its live SOL equivalent.
+    The demo balance itself is chain-agnostic USD, shared across every
+    chain the user trades on."""
     usd_balance = float(user["balance"])
     sol_price = await market.get_sol_price()
     sol_equiv = usd_balance / sol_price if sol_price else 0.0
@@ -173,6 +197,7 @@ def format_position_card(
     name: str,
     symbol: str,
     token_address: str,
+    chain: str,
     entry_price: float,
     entry_market_cap,
     current_market_cap,
@@ -182,14 +207,16 @@ def format_position_card(
     pnl_pct: float,
     tp_price=None,
     sl_price=None,
+    dca_note: str = "",
 ) -> str:
     """Render a clean, refreshable position summary keyed on market cap."""
     timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    chart_url = token_chart_url(token_address)
+    chart_url = token_chart_url(token_address, chain)
     entry_mcap = float(entry_market_cap or 0)
 
     return (
-        f"📌 <b>{html.escape(name)}</b> ({html.escape(symbol)})\n\n"
+        f"📌 <b>{html.escape(name)}</b> ({html.escape(symbol)}) · {html.escape(chain_label(chain))}\n"
+        f"{dca_note}\n"
         f"Entry: <b>{fmt_compact(entry_mcap)}</b>\n"
         f"Current: <b>{fmt_compact(current_market_cap)}</b>\n"
         f"💵 Invested: {fmt_usd(invested)}\n\n"
@@ -201,59 +228,92 @@ def format_position_card(
     )
 
 
-def build_position_keyboard(token_address: str) -> InlineKeyboardMarkup:
+def build_position_keyboard(token_address: str, chain: str) -> InlineKeyboardMarkup:
+    """Buy (DCA) buttons sit above the sell buttons - buying more of a
+    position the user already holds is at least as common an action as
+    selling it, and putting it first keeps DCA one tap away instead of
+    burying it back on the token-info card."""
+    presets = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
+    buy_rows = [
+        [
+            InlineKeyboardButton(
+                f"➕ Buy {amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}"
+            )
+            for amt in presets[i : i + 2]
+        ]
+        for i in range(0, len(presets), 2)
+    ]
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{token_address}")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{chain}:{token_address}")],
+            *buy_rows,
+            [InlineKeyboardButton("✏️ Custom Buy", callback_data=f"buycustom:{chain}:{token_address}")],
             [
-                InlineKeyboardButton("🎯 Set TP", callback_data=f"tpmenu:{token_address}"),
-                InlineKeyboardButton("🛑 Set SL", callback_data=f"slmenu:{token_address}"),
+                InlineKeyboardButton("🎯 Set TP", callback_data=f"tpmenu:{chain}:{token_address}"),
+                InlineKeyboardButton("🛑 Set SL", callback_data=f"slmenu:{chain}:{token_address}"),
             ],
             [
-                InlineKeyboardButton("💸 Sell 50%", callback_data=f"sell:{token_address}:50"),
-                InlineKeyboardButton("💯 Sell 100%", callback_data=f"sell:{token_address}:100"),
+                InlineKeyboardButton("💸 Sell 50%", callback_data=f"sell:{chain}:{token_address}:50"),
+                InlineKeyboardButton("💯 Sell 100%", callback_data=f"sell:{chain}:{token_address}:100"),
             ],
-            [InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address))],
+            [InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address, chain))],
         ]
     )
 
 
-def build_tp_menu_keyboard(token_address: str) -> InlineKeyboardMarkup:
+def build_tp_menu_keyboard(token_address: str, chain: str) -> InlineKeyboardMarkup:
     rows = []
     for i in range(0, len(TP_PRESETS), 2):
         rows.append(
             [
-                InlineKeyboardButton(f"🎯 {m}x", callback_data=f"tpset:{token_address}:{m}")
+                InlineKeyboardButton(f"🎯 {m}x", callback_data=f"tpset:{chain}:{token_address}:{m}")
                 for m in TP_PRESETS[i : i + 2]
             ]
         )
-    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"tpcustom:{token_address}")])
-    rows.append([InlineKeyboardButton("❌ Clear TP", callback_data=f"tpset:{token_address}:0")])
-    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{token_address}")])
+    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"tpcustom:{chain}:{token_address}")])
+    rows.append([InlineKeyboardButton("❌ Clear TP", callback_data=f"tpset:{chain}:{token_address}:0")])
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{chain}:{token_address}")])
     return InlineKeyboardMarkup(rows)
 
 
-def build_sl_menu_keyboard(token_address: str) -> InlineKeyboardMarkup:
+def build_sl_menu_keyboard(token_address: str, chain: str) -> InlineKeyboardMarkup:
     rows = []
     for i in range(0, len(SL_PRESETS), 2):
         rows.append(
             [
-                InlineKeyboardButton(f"🛑 -{p}%", callback_data=f"slset:{token_address}:{p}")
+                InlineKeyboardButton(f"🛑 -{p}%", callback_data=f"slset:{chain}:{token_address}:{p}")
                 for p in SL_PRESETS[i : i + 2]
             ]
         )
-    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"slcustom:{token_address}")])
-    rows.append([InlineKeyboardButton("❌ Clear SL", callback_data=f"slset:{token_address}:0")])
-    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{token_address}")])
+    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"slcustom:{chain}:{token_address}")])
+    rows.append([InlineKeyboardButton("❌ Clear SL", callback_data=f"slset:{chain}:{token_address}:0")])
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{chain}:{token_address}")])
     return InlineKeyboardMarkup(rows)
 
 
-async def render_position_card(user_id: str, token_address: str, live: bool = True):
+def build_chain_picker_keyboard(token_address: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(chain_label(c), callback_data=f"pickchain:{token_address}:{c}")]
+        for c in EVM_CHAINS
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_chain_picker(target, token_address: str) -> None:
+    """EVM addresses are ambiguous across Ethereum / BNB Chain / Robinhood
+    Chain, so ask which one before fetching any market data."""
+    await target.reply_text(
+        "That looks like an EVM address - which chain is it on?",
+        reply_markup=build_chain_picker_keyboard(token_address),
+    )
+
+
+async def render_position_card(user_id: str, token_address: str, chain: str, live: bool = True):
     """Builds the (text, keyboard) pair for a position card. Returns None if
     the position no longer exists. `live=False` reuses the last-known
     price/mcap from the DB instead of hitting the market data API again - used for
     quick menu navigation where a fresh quote isn't necessary."""
-    position = await db.get_position(user_id, token_address)
+    position = await db.get_position(user_id, token_address, chain)
     if not position:
         return None
 
@@ -266,7 +326,7 @@ async def render_position_card(user_id: str, token_address: str, live: bool = Tr
     current_mcap = float(position.get("current_market_cap") or entry_mcap)
 
     if live:
-        token_data = await market.get_token_data(token_address)
+        token_data = await market.get_token_data(token_address, chain)
         if token_data and token_data["price_usd"] > 0:
             current_price = token_data["price_usd"]
             current_mcap = float(token_data.get("market_cap") or 0)
@@ -278,6 +338,7 @@ async def render_position_card(user_id: str, token_address: str, live: bool = Tr
         name=position["token_name"],
         symbol=position["token_symbol"],
         token_address=token_address,
+        chain=chain,
         entry_price=entry_price,
         entry_market_cap=entry_mcap,
         current_market_cap=current_mcap,
@@ -288,7 +349,7 @@ async def render_position_card(user_id: str, token_address: str, live: bool = Tr
         tp_price=position.get("tp_price"),
         sl_price=position.get("sl_price"),
     )
-    return text, build_position_keyboard(token_address)
+    return text, build_position_keyboard(token_address, chain)
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +359,19 @@ async def render_position_card(user_id: str, token_address: str, live: bool = Tr
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await get_user(update)
     balance_line = await balance_block(user)
+    chains_line = " / ".join(chain_label(c) for c in [DEFAULT_CHAIN, *EVM_CHAINS])
     await update.message.reply_text(
         "🚤 <b>PAPERBOAT</b> — Demo Trading Bot\n"
-        "Practice Solana trading with real market data and zero risk.\n"
+        "Practice trading with real market data and zero risk.\n"
         "No wallet. No private keys. No real funds.\n"
         "All trades are simulated with a demo balance.\n\n"
+        f"⛓ Chains: {chains_line}\n\n"
         f"{balance_line}\n\n"
-        "📩 Send any Solana token CA to view live data and trade.\n"
+        "📩 Send any token contract address to view live data and trade.\n"
+        "Solana addresses are detected automatically; for Ethereum / BNB "
+        "Chain / Robinhood Chain addresses I'll ask which chain it's on.\n"
+        "➕ Already holding a token? Tap Buy again on its position card to "
+        "DCA in - your average entry updates automatically.\n"
         "🎯 Set Take Profit / Stop Loss and let PaperBoat manage your "
         "positions automatically.\n\n"
         "<b>Commands:</b>\n"
@@ -360,6 +427,7 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(overview, parse_mode=ParseMode.HTML)
 
     for pos in positions:
+        chain = pos.get("chain") or DEFAULT_CHAIN
         amount = float(pos["amount"])
         invested = float(pos["invested_amount"])
         entry_price = float(pos["entry_price"])
@@ -374,6 +442,7 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             name=pos["token_name"],
             symbol=pos["token_symbol"],
             token_address=pos["token_address"],
+            chain=chain,
             entry_price=entry_price,
             entry_market_cap=entry_mcap,
             current_market_cap=current_mcap,
@@ -387,7 +456,7 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=build_position_keyboard(pos["token_address"]),
+            reply_markup=build_position_keyboard(pos["token_address"], chain),
             disable_web_page_preview=True,
         )
 
@@ -405,8 +474,9 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         side = t["trade_type"]
         side_emoji = "🟢" if side == "BUY" else "🔴"
         pnl_str = f" | PNL: {fmt_usd(t['pnl'])}" if side == "SELL" else ""
+        chain_tag = chain_label(t.get("chain") or DEFAULT_CHAIN)
         lines.append(
-            f"{side_emoji} <b>{side}</b> {html.escape(t['token_symbol'])} "
+            f"{side_emoji} <b>{side}</b> {html.escape(t['token_symbol'])} ({chain_tag}) "
             f"— {fmt_usd(t['total_value'])}{pnl_str}"
         )
 
@@ -421,12 +491,13 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Token info + trading flow
 # ---------------------------------------------------------------------------
 
-def build_token_info_text(token_data: dict, token_address: str) -> str:
-    chart_url = token_chart_url(token_address, token_data.get("dex_url", ""))
+def build_token_info_text(token_data: dict, token_address: str, chain: str) -> str:
+    chart_url = token_chart_url(token_address, chain, token_data.get("dex_url", ""))
     pct_1h = float(token_data.get("price_change_1h") or 0)
     change_emoji = "📈" if pct_1h >= 0 else "📉"
     return (
-        f"⚡ <b>{html.escape(token_data['name'])}</b> ({html.escape(token_data['symbol'])})\n\n"
+        f"⚡ <b>{html.escape(token_data['name'])}</b> ({html.escape(token_data['symbol'])}) "
+        f"· {html.escape(chain_label(chain))}\n\n"
         f"💰 MC: <b>{fmt_compact(token_data['market_cap'])}</b>\n"
         f"📊 24h Vol: {fmt_compact(token_data['volume_24h'])}\n"
         f"{change_emoji} 1h: {pct_1h:+.2f}%\n\n"
@@ -435,37 +506,39 @@ def build_token_info_text(token_data: dict, token_address: str) -> str:
     )
 
 
-def build_token_info_keyboard(token_address: str, dex_url: str = "") -> InlineKeyboardMarkup:
+def build_token_info_keyboard(token_address: str, chain: str, dex_url: str = "") -> InlineKeyboardMarkup:
+    presets = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
     keyboard = [
         [
-            InlineKeyboardButton("BUY 0.1", callback_data=f"buy:{token_address}:0.1"),
-            InlineKeyboardButton("BUY 0.5", callback_data=f"buy:{token_address}:0.5"),
-        ],
-        [
-            InlineKeyboardButton("BUY 0.6", callback_data=f"buy:{token_address}:0.6"),
-            InlineKeyboardButton("BUY 1", callback_data=f"buy:{token_address}:1"),
-        ],
-        [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"buycustom:{token_address}")],
-        [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"refreshtoken:{token_address}"),
-            InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address, dex_url)),
-        ],
+            InlineKeyboardButton(f"BUY {amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}")
+            for amt in presets[i : i + 2]
+        ]
+        for i in range(0, len(presets), 2)
     ]
+    keyboard.append(
+        [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"buycustom:{chain}:{token_address}")]
+    )
+    keyboard.append(
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refreshtoken:{chain}:{token_address}"),
+            InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address, chain, dex_url)),
+        ]
+    )
     return InlineKeyboardMarkup(keyboard)
 
 
-async def show_token_info(update: Update, token_address: str) -> None:
-    token_data = await market.get_token_data(token_address)
+async def show_token_info(target, token_address: str, chain: str) -> None:
+    token_data = await market.get_token_data(token_address, chain)
     if not token_data:
-        await update.message.reply_text(
-            "⚠️ Couldn't find that token. Double check the contract address."
+        await target.reply_text(
+            f"⚠️ Couldn't find that token on {chain_label(chain)}. Double check the contract address."
         )
         return
 
-    text = build_token_info_text(token_data, token_address)
-    keyboard = build_token_info_keyboard(token_address, token_data.get("dex_url", ""))
+    text = build_token_info_text(token_data, token_address, chain)
+    keyboard = build_token_info_keyboard(token_address, chain, token_data.get("dex_url", ""))
 
-    await update.message.reply_text(
+    await target.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
@@ -473,14 +546,38 @@ async def show_token_info(update: Update, token_address: str) -> None:
     )
 
 
-async def process_refresh_token(query, token_address: str) -> None:
-    token_data = await market.get_token_data(token_address)
+async def process_pick_chain(query, token_address: str, chain: str) -> None:
+    """User picked which EVM chain their pasted address is on."""
+    token_data = await market.get_token_data(token_address, chain)
+    if not token_data:
+        await query.answer(
+            f"Couldn't find that token on {chain_label(chain)}.", show_alert=True
+        )
+        return
+
+    text = build_token_info_text(token_data, token_address, chain)
+    keyboard = build_token_info_keyboard(token_address, chain, token_data.get("dex_url", ""))
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+    await query.answer()
+
+
+async def process_refresh_token(query, chain: str, token_address: str) -> None:
+    token_data = await market.get_token_data(token_address, chain)
     if not token_data:
         await query.answer("Couldn't fetch live data right now. Try again shortly.", show_alert=True)
         return
 
-    text = build_token_info_text(token_data, token_address)
-    keyboard = build_token_info_keyboard(token_address, token_data.get("dex_url", ""))
+    text = build_token_info_text(token_data, token_address, chain)
+    keyboard = build_token_info_keyboard(token_address, chain, token_data.get("dex_url", ""))
 
     try:
         await query.edit_message_text(
@@ -496,11 +593,11 @@ async def process_refresh_token(query, token_address: str) -> None:
     await query.answer("Updated")
 
 
-async def process_buy(update: Update, target, token_address: str, sol_amount: float,
+async def process_buy(update: Update, target, token_address: str, native_amount: float, chain: str,
                        delete_chat_id=None, delete_message_id=None) -> None:
     user = await get_user(update)
     try:
-        result = await trading.execute_buy(user, token_address, sol_amount)
+        result = await trading.execute_buy(user, token_address, native_amount, chain)
     except trading.TradingError as exc:
         await target.reply_text(f"⚠️ {exc}")
         return
@@ -511,28 +608,37 @@ async def process_buy(update: Update, target, token_address: str, sol_amount: fl
 
     # Re-read the position so an add-to-existing-position buy still reflects
     # any TP/SL that was already set on it.
-    position_row = await db.get_position(user["id"], token_address)
+    position_row = await db.get_position(user["id"], token_address, chain)
     tp_price = position_row.get("tp_price") if position_row else None
     sl_price = position_row.get("sl_price") if position_row else None
+
+    dca_note = ""
+    if result.get("is_dca"):
+        dca_note = (
+            f"➕ <i>DCA'd in {fmt_native(result['native_amount'], chain)} "
+            f"({fmt_usd(result['usd_amount'])}) — new avg entry below</i>\n"
+        )
 
     text = format_position_card(
         name=result["token_name"],
         symbol=result["token_symbol"],
         token_address=token_address,
-        entry_price=result["entry_price"],
-        entry_market_cap=result["entry_market_cap"],
+        chain=chain,
+        entry_price=result["avg_entry_price"],
+        entry_market_cap=result["avg_entry_market_cap"],
         current_market_cap=result["entry_market_cap"],
-        tokens=result["tokens_bought"],
-        invested=result["usd_amount"],
+        tokens=result["total_amount"],
+        invested=result["total_invested"],
         pnl=0.0,
         pnl_pct=0.0,
         tp_price=tp_price,
         sl_price=sl_price,
+        dca_note=dca_note,
     )
     await target.reply_text(
         text,
         parse_mode=ParseMode.HTML,
-        reply_markup=build_position_keyboard(token_address),
+        reply_markup=build_position_keyboard(token_address, chain),
         disable_web_page_preview=True,
     )
 
@@ -548,14 +654,14 @@ async def process_buy(update: Update, target, token_address: str, sol_amount: fl
             )
 
 
-async def process_tp_menu(query, token_address: str) -> None:
+async def process_tp_menu(query, chain: str, token_address: str) -> None:
     try:
         await query.edit_message_text(
             "🎯 <b>Set Take Profit</b>\n\n"
             "Choose a target as a multiple of your entry market cap "
             "(e.g. 2x auto-sells once the cap doubles).",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_tp_menu_keyboard(token_address),
+            reply_markup=build_tp_menu_keyboard(token_address, chain),
         )
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
@@ -563,14 +669,14 @@ async def process_tp_menu(query, token_address: str) -> None:
     await query.answer()
 
 
-async def process_sl_menu(query, token_address: str) -> None:
+async def process_sl_menu(query, chain: str, token_address: str) -> None:
     try:
         await query.edit_message_text(
             "🛑 <b>Set Stop Loss</b>\n\n"
             "Choose a target as a percent below your entry market cap "
             "(e.g. -20% auto-sells if the cap drops that far).",
             parse_mode=ParseMode.HTML,
-            reply_markup=build_sl_menu_keyboard(token_address),
+            reply_markup=build_sl_menu_keyboard(token_address, chain),
         )
     except BadRequest as exc:
         if "not modified" not in str(exc).lower():
@@ -578,8 +684,8 @@ async def process_sl_menu(query, token_address: str) -> None:
     await query.answer()
 
 
-async def apply_tp(user_id: str, token_address: str, multiple: float):
-    position = await db.get_position(user_id, token_address)
+async def apply_tp(user_id: str, token_address: str, chain: str, multiple: float):
+    position = await db.get_position(user_id, token_address, chain)
     if not position:
         return None
     entry_price = float(position["entry_price"])
@@ -589,8 +695,8 @@ async def apply_tp(user_id: str, token_address: str, multiple: float):
     return True
 
 
-async def apply_sl(user_id: str, token_address: str, percent: float):
-    position = await db.get_position(user_id, token_address)
+async def apply_sl(user_id: str, token_address: str, chain: str, percent: float):
+    position = await db.get_position(user_id, token_address, chain)
     if not position:
         return None
     entry_price = float(position["entry_price"])
@@ -600,34 +706,34 @@ async def apply_sl(user_id: str, token_address: str, percent: float):
     return True
 
 
-async def process_tp_set(query, token_address: str, multiple: float) -> None:
+async def process_tp_set(query, chain: str, token_address: str, multiple: float) -> None:
     tg_user = query.from_user
     user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
 
-    applied = await apply_tp(user["id"], token_address, multiple)
+    applied = await apply_tp(user["id"], token_address, chain, multiple)
     if applied is None:
         await query.answer("This position is no longer open.", show_alert=True)
         return
 
-    await show_position_card(query, user["id"], token_address, live=False)
+    await show_position_card(query, user["id"], token_address, chain, live=False)
     await query.answer("Take Profit set" if multiple > 0 else "Take Profit cleared")
 
 
-async def process_sl_set(query, token_address: str, percent: float) -> None:
+async def process_sl_set(query, chain: str, token_address: str, percent: float) -> None:
     tg_user = query.from_user
     user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
 
-    applied = await apply_sl(user["id"], token_address, percent)
+    applied = await apply_sl(user["id"], token_address, chain, percent)
     if applied is None:
         await query.answer("This position is no longer open.", show_alert=True)
         return
 
-    await show_position_card(query, user["id"], token_address, live=False)
+    await show_position_card(query, user["id"], token_address, chain, live=False)
     await query.answer("Stop Loss set" if percent > 0 else "Stop Loss cleared")
 
 
-async def show_position_card(query, user_id: str, token_address: str, live: bool = True) -> None:
-    rendered = await render_position_card(user_id, token_address, live=live)
+async def show_position_card(query, user_id: str, token_address: str, chain: str, live: bool = True) -> None:
+    rendered = await render_position_card(user_id, token_address, chain, live=live)
     if not rendered:
         await query.answer("This position has been closed.", show_alert=True)
         try:
@@ -649,22 +755,22 @@ async def show_position_card(query, user_id: str, token_address: str, live: bool
             raise
 
 
-async def process_refresh(query, token_address: str) -> None:
+async def process_refresh(query, chain: str, token_address: str) -> None:
     tg_user = query.from_user
     user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
-    await show_position_card(query, user["id"], token_address, live=True)
+    await show_position_card(query, user["id"], token_address, chain, live=True)
     await query.answer("Updated")
 
 
-async def process_back_to_position(query, token_address: str) -> None:
+async def process_back_to_position(query, chain: str, token_address: str) -> None:
     tg_user = query.from_user
     user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
-    await show_position_card(query, user["id"], token_address, live=False)
+    await show_position_card(query, user["id"], token_address, chain, live=False)
     await query.answer()
 
 
 async def process_sell(
-    update: Update, target, token_address: str, percent: float, loading_query=None
+    update: Update, target, token_address: str, percent: float, chain: str, loading_query=None
 ) -> None:
     """Executes a sell. When triggered from a Sell button (`loading_query`
     set), the originating message is swapped to a "Selling..." placeholder
@@ -690,7 +796,7 @@ async def process_sell(
         await target.reply_text(message)
 
     try:
-        result = await trading.execute_sell(user, token_address, percent)
+        result = await trading.execute_sell(user, token_address, percent, chain)
     except trading.TradingError as exc:
         await _fail(f"⚠️ {exc}")
         return
@@ -718,7 +824,7 @@ async def process_sell(
 
     text = (
         "💸 <b>SELL EXECUTED</b>\n\n"
-        f"{html.escape(result['token_name'])} ({html.escape(result['token_symbol'])})\n\n"
+        f"{html.escape(result['token_name'])} ({html.escape(result['token_symbol'])}) · {chain_label(chain)}\n\n"
         f"Entry MCap: {fmt_compact(result['entry_market_cap'])}\n"
         f"Exit MCap: {fmt_compact(result['exit_market_cap'])}\n"
         f"Received: {fmt_usd(result['proceeds'])}\n\n"
@@ -751,7 +857,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text("Please send a valid number, e.g. 0.75")
             return
         await process_buy(
-            update, update.message, pending_ca, amount,
+            update, update.message, pending_ca["token_address"], amount, pending_ca["chain"],
             delete_chat_id=origin.get("chat_id") if origin else None,
             delete_message_id=origin.get("message_id") if origin else None,
         )
@@ -768,11 +874,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text("Please send a valid multiple, e.g. 4 for 4x")
             return
         user = await get_user(update)
-        applied = await apply_tp(user["id"], pending_tp, multiple)
+        applied = await apply_tp(user["id"], pending_tp["token_address"], pending_tp["chain"], multiple)
         if applied is None:
             await update.message.reply_text("That position is no longer open.")
             return
-        rendered = await render_position_card(user["id"], pending_tp, live=False)
+        rendered = await render_position_card(user["id"], pending_tp["token_address"], pending_tp["chain"], live=False)
         if rendered:
             text_out, keyboard = rendered
             await update.message.reply_text(
@@ -791,11 +897,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text("Please send a valid percent, e.g. 25 for -25%")
             return
         user = await get_user(update)
-        applied = await apply_sl(user["id"], pending_sl, percent)
+        applied = await apply_sl(user["id"], pending_sl["token_address"], pending_sl["chain"], percent)
         if applied is None:
             await update.message.reply_text("That position is no longer open.")
             return
-        rendered = await render_position_card(user["id"], pending_sl, live=False)
+        rendered = await render_position_card(user["id"], pending_sl["token_address"], pending_sl["chain"], live=False)
         if rendered:
             text_out, keyboard = rendered
             await update.message.reply_text(
@@ -804,7 +910,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if SOLANA_CA_REGEX.match(text):
-        await show_token_info(update, text)
+        await show_token_info(update.message, text, "sol")
+    elif EVM_CA_REGEX.match(text):
+        await show_chain_picker(update.message, text)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -816,51 +924,54 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Each branch answers the callback query exactly once - Telegram rejects
     # a second answer() call on the same query, so several branches handle
     # their own (with a toast/alert) instead of us answering here up front.
-    if action == "buy" and len(parts) == 3:
+    if action == "buy" and len(parts) == 4:
         await query.answer()
-        token_address, amount_str = parts[1], parts[2]
+        chain, token_address, amount_str = parts[1], parts[2], parts[3]
         await process_buy(
-            update, query.message, token_address, float(amount_str),
+            update, query.message, token_address, float(amount_str), chain,
             delete_chat_id=query.message.chat_id,
             delete_message_id=query.message.message_id,
         )
-    elif action == "buycustom" and len(parts) == 2:
+    elif action == "buycustom" and len(parts) == 3:
         await query.answer()
-        token_address = parts[1]
-        context.user_data["awaiting_custom_buy"] = token_address
+        chain, token_address = parts[1], parts[2]
+        context.user_data["awaiting_custom_buy"] = {"chain": chain, "token_address": token_address}
         context.user_data["awaiting_custom_buy_origin"] = {
             "chat_id": query.message.chat_id,
             "message_id": query.message.message_id,
         }
-        await query.message.reply_text("Send the amount of SOL you'd like to spend, e.g. 0.75")
-    elif action == "sell" and len(parts) == 3:
+        symbol = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["native_symbol"]
+        await query.message.reply_text(f"Send the amount of {symbol} you'd like to spend, e.g. 0.75")
+    elif action == "sell" and len(parts) == 4:
         await query.answer()
-        token_address, percent_str = parts[1], parts[2]
+        chain, token_address, percent_str = parts[1], parts[2], parts[3]
         await process_sell(
-            update, query.message, token_address, float(percent_str), loading_query=query
+            update, query.message, token_address, float(percent_str), chain, loading_query=query
         )
-    elif action == "refresh" and len(parts) == 2:
-        await process_refresh(query, parts[1])
-    elif action == "refreshtoken" and len(parts) == 2:
-        await process_refresh_token(query, parts[1])
-    elif action == "tpmenu" and len(parts) == 2:
-        await process_tp_menu(query, parts[1])
-    elif action == "slmenu" and len(parts) == 2:
-        await process_sl_menu(query, parts[1])
-    elif action == "tpset" and len(parts) == 3:
-        await process_tp_set(query, parts[1], float(parts[2]))
-    elif action == "slset" and len(parts) == 3:
-        await process_sl_set(query, parts[1], float(parts[2]))
-    elif action == "tpcustom" and len(parts) == 2:
+    elif action == "refresh" and len(parts) == 3:
+        await process_refresh(query, parts[1], parts[2])
+    elif action == "refreshtoken" and len(parts) == 3:
+        await process_refresh_token(query, parts[1], parts[2])
+    elif action == "tpmenu" and len(parts) == 3:
+        await process_tp_menu(query, parts[1], parts[2])
+    elif action == "slmenu" and len(parts) == 3:
+        await process_sl_menu(query, parts[1], parts[2])
+    elif action == "tpset" and len(parts) == 4:
+        await process_tp_set(query, parts[1], parts[2], float(parts[3]))
+    elif action == "slset" and len(parts) == 4:
+        await process_sl_set(query, parts[1], parts[2], float(parts[3]))
+    elif action == "tpcustom" and len(parts) == 3:
         await query.answer()
-        context.user_data["awaiting_custom_tp"] = parts[1]
+        context.user_data["awaiting_custom_tp"] = {"chain": parts[1], "token_address": parts[2]}
         await query.message.reply_text("Send your TP as a multiple of entry market cap, e.g. 4 for 4x")
-    elif action == "slcustom" and len(parts) == 2:
+    elif action == "slcustom" and len(parts) == 3:
         await query.answer()
-        context.user_data["awaiting_custom_sl"] = parts[1]
+        context.user_data["awaiting_custom_sl"] = {"chain": parts[1], "token_address": parts[2]}
         await query.message.reply_text("Send your SL as a percent below entry market cap, e.g. 25 for -25%")
-    elif action == "backpos" and len(parts) == 2:
-        await process_back_to_position(query, parts[1])
+    elif action == "backpos" and len(parts) == 3:
+        await process_back_to_position(query, parts[1], parts[2])
+    elif action == "pickchain" and len(parts) == 3:
+        await process_pick_chain(query, parts[1], parts[2])
     else:
         await query.answer()
 
@@ -893,8 +1004,9 @@ async def check_tp_sl_triggers() -> None:
         if not user:
             continue
 
+        chain = pos.get("chain") or DEFAULT_CHAIN
         try:
-            result = await trading.execute_sell(user, pos["token_address"], 100)
+            result = await trading.execute_sell(user, pos["token_address"], 100, chain)
         except trading.TradingError:
             continue
         except Exception:

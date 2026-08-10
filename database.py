@@ -80,14 +80,18 @@ async def get_user_by_id(user_id: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 # Positions
 # ---------------------------------------------------------------------------
+# Positions are keyed on (user_id, token_address, chain) rather than just
+# (user_id, token_address) - the same address string can be an unrelated
+# token on a different EVM chain (eth / bsc / rbh), so chain disambiguates.
 
-async def get_position(user_id: str, token_address: str) -> Optional[dict]:
+async def get_position(user_id: str, token_address: str, chain: str) -> Optional[dict]:
     def _op():
         res = (
             supabase.table("positions")
             .select("*")
             .eq("user_id", user_id)
             .eq("token_address", token_address)
+            .eq("chain", chain)
             .limit(1)
             .execute()
         )

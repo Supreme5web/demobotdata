@@ -4,6 +4,7 @@ import logging
 
 import database as db
 import market
+from config import CHAINS, DEFAULT_CHAIN
 
 logger = logging.getLogger(__name__)
 
@@ -12,23 +13,33 @@ class TradingError(Exception):
     """Raised for user-facing trading failures (insufficient balance, bad price, etc.)."""
 
 
-async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict:
-    """Buy a token using a SOL-denominated amount, converted to demo USD."""
-    if sol_amount <= 0:
+async def execute_buy(user: dict, token_address: str, native_amount: float, chain: str = DEFAULT_CHAIN) -> dict:
+    """Buy a token using an amount denominated in the chain's native gas
+    token (SOL / ETH / BNB), converted to demo USD.
+
+    If the user already holds this token on this chain, this DCAs into the
+    existing position: the new buy's cost is added to invested_amount, and
+    entry_price / entry_market_cap are recomputed as the invested-amount-
+    weighted average across the old and new fills, so a second (or third,
+    or Nth) buy always reflects the true blended average entry rather than
+    just the latest fill price.
+    """
+    if native_amount <= 0:
         raise TradingError("Amount must be greater than zero.")
 
-    token_data = await market.get_token_data(token_address)
+    token_data = await market.get_token_data(token_address, chain)
     if not token_data or token_data["price_usd"] <= 0:
         raise TradingError("Could not fetch a valid price for this token right now.")
 
-    sol_price = await market.get_sol_price()
-    usd_amount = sol_amount * sol_price
+    native_price = await market.get_native_price(chain)
+    usd_amount = native_amount * native_price
 
     balance = float(user["balance"])
     if usd_amount > balance:
+        symbol = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["native_symbol"]
         raise TradingError(
             f"Insufficient demo balance. You have ${balance:,.2f}, "
-            f"this trade needs ~${usd_amount:,.2f}."
+            f"this trade needs ~${usd_amount:,.2f} ({native_amount:g} {symbol})."
         )
 
     entry_price = token_data["price_usd"]
@@ -38,15 +49,20 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
 
     await db.update_balance(user["id"], new_balance)
 
-    existing = await db.get_position(user["id"], token_address)
+    existing = await db.get_position(user["id"], token_address, chain)
     if existing:
+        # --- DCA into the existing position -------------------------------
         old_amount = float(existing["amount"])
         old_invested = float(existing["invested_amount"])
         old_entry_mcap = float(existing.get("entry_market_cap") or entry_market_cap)
         new_amount = old_amount + tokens_bought
         new_invested = old_invested + usd_amount
+        # Average entry price = total $ invested / total tokens held - the
+        # standard cost-basis formula, so repeated buys always land on the
+        # correct blended entry regardless of how many fills went into it.
         new_entry_price = new_invested / new_amount if new_amount else entry_price
-        # Weight the blended entry market cap by invested amount, same approach as entry price.
+        # Entry market cap is weighted the same way (by $ invested at each
+        # fill) so it stays consistent with the blended entry price above.
         new_entry_mcap = (
             ((old_entry_mcap * old_invested) + (entry_market_cap * usd_amount)) / new_invested
             if new_invested
@@ -63,11 +79,17 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
                 "current_market_cap": entry_market_cap,
             },
         )
+        avg_entry_price = new_entry_price
+        avg_entry_mcap = new_entry_mcap
+        total_amount = new_amount
+        total_invested = new_invested
+        is_dca = True
     else:
         await db.create_position(
             {
                 "user_id": user["id"],
                 "token_address": token_address,
+                "chain": chain,
                 "token_symbol": token_data["symbol"],
                 "token_name": token_data["name"],
                 "amount": tokens_bought,
@@ -79,11 +101,17 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
                 "unrealized_pnl": 0,
             }
         )
+        avg_entry_price = entry_price
+        avg_entry_mcap = entry_market_cap
+        total_amount = tokens_bought
+        total_invested = usd_amount
+        is_dca = False
 
     await db.add_trade(
         {
             "user_id": user["id"],
             "token_address": token_address,
+            "chain": chain,
             "token_symbol": token_data["symbol"],
             "trade_type": "BUY",
             "amount": tokens_bought,
@@ -97,25 +125,33 @@ async def execute_buy(user: dict, token_address: str, sol_amount: float) -> dict
         "token_name": token_data["name"],
         "token_symbol": token_data["symbol"],
         "token_address": token_address,
-        "sol_amount": sol_amount,
+        "chain": chain,
+        "native_amount": native_amount,
         "usd_amount": usd_amount,
         "entry_price": entry_price,
         "entry_market_cap": entry_market_cap,
         "tokens_bought": tokens_bought,
         "new_balance": new_balance,
+        # Position-level (post-fill) figures - what the card should display
+        # so a DCA buy shows the true blended average, not just this fill.
+        "avg_entry_price": avg_entry_price,
+        "avg_entry_market_cap": avg_entry_mcap,
+        "total_amount": total_amount,
+        "total_invested": total_invested,
+        "is_dca": is_dca,
     }
 
 
-async def execute_sell(user: dict, token_address: str, percent: float) -> dict:
+async def execute_sell(user: dict, token_address: str, percent: float, chain: str = DEFAULT_CHAIN) -> dict:
     """Sell a percentage (1-100) of an existing position."""
     if not (0 < percent <= 100):
         raise TradingError("Invalid sell percentage.")
 
-    position = await db.get_position(user["id"], token_address)
+    position = await db.get_position(user["id"], token_address, chain)
     if not position:
         raise TradingError("You don't have an open position in this token.")
 
-    token_data = await market.get_token_data(token_address)
+    token_data = await market.get_token_data(token_address, chain)
     if not token_data or token_data["price_usd"] <= 0:
         raise TradingError("Could not fetch a valid price for this token right now.")
 
@@ -154,6 +190,7 @@ async def execute_sell(user: dict, token_address: str, percent: float) -> dict:
         {
             "user_id": user["id"],
             "token_address": token_address,
+            "chain": chain,
             "token_symbol": position["token_symbol"],
             "trade_type": "SELL",
             "amount": sell_amount,
@@ -167,6 +204,7 @@ async def execute_sell(user: dict, token_address: str, percent: float) -> dict:
         "token_name": position["token_name"],
         "token_symbol": position["token_symbol"],
         "token_address": token_address,
+        "chain": chain,
         "entry_price": entry_price,
         "exit_price": exit_price,
         "entry_market_cap": entry_market_cap,
@@ -189,7 +227,8 @@ async def refresh_all_positions() -> None:
     positions = await db.get_all_positions()
     for pos in positions:
         try:
-            token_data = await market.get_token_data(pos["token_address"])
+            chain = pos.get("chain") or DEFAULT_CHAIN
+            token_data = await market.get_token_data(pos["token_address"], chain)
             if not token_data or token_data["price_usd"] <= 0:
                 continue
             price = token_data["price_usd"]

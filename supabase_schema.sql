@@ -33,6 +33,10 @@ create table if not exists positions (
 alter table if exists positions add column if not exists tp_price numeric;
 alter table if exists positions add column if not exists sl_price numeric;
 
+-- Safe to re-run: adds multi-chain support. Existing rows (all Solana,
+-- pre-dating this column) default to 'sol' so old positions keep working.
+alter table if exists positions add column if not exists chain text not null default 'sol';
+
 create table if not exists trades (
     id uuid primary key default gen_random_uuid(),
     user_id uuid not null references users(id) on delete cascade,
@@ -46,6 +50,14 @@ create table if not exists trades (
     created_at timestamptz not null default now()
 );
 
+alter table if exists trades add column if not exists chain text not null default 'sol';
+
+-- A user can hold the same token_address as an unrelated token on a
+-- different chain, so positions are unique per (user, token, chain) rather
+-- than per (user, token).
+drop index if exists idx_positions_token_address;
+create unique index if not exists idx_positions_user_token_chain
+    on positions(user_id, token_address, chain);
+
 create index if not exists idx_positions_user_id on positions(user_id);
-create index if not exists idx_positions_token_address on positions(token_address);
 create index if not exists idx_trades_user_id on trades(user_id);
