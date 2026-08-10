@@ -1109,6 +1109,17 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
 
 
+async def delete_pin_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Telegram auto-posts a '<Bot> pinned a message' service message in the
+    chat every time pin_chat_message() succeeds - disable_notification only
+    silences the alert, it doesn't stop the message itself. This deletes it
+    right away so it doesn't clutter the chat."""
+    try:
+        await update.message.delete()
+    except Exception:
+        logger.debug("Could not delete pin service message", exc_info=True)
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     data = query.data or ""
@@ -1261,6 +1272,7 @@ telegram_app.add_handler(CommandHandler("history", history_handler))
 telegram_app.add_handler(CommandHandler("settings", settings_handler))
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+telegram_app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, delete_pin_service_message))
 
 BOT_COMMANDS = [
     BotCommand("start", "Welcome & how it works"),
