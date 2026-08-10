@@ -230,6 +230,8 @@ async def execute_sell(user: dict, token_address: str, percent: float, chain: st
         "entry_time": position.get("created_at"),
         "logo_url": token_data.get("logo_url", ""),
         "username": user.get("username") or "",
+        "pinned_chat_id": position.get("pinned_chat_id"),
+        "pinned_message_id": position.get("pinned_message_id"),
     }
 
 

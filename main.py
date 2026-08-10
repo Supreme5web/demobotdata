@@ -743,12 +743,36 @@ async def process_buy(update: Update, target, token_address: str, usdc_amount: f
         tp_price=tp_price,
         sl_price=sl_price,
     )
-    await target.reply_text(
+    sent_message = await target.reply_text(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=build_position_keyboard(token_address, chain, get_buy_presets(user, chain)),
         disable_web_page_preview=True,
     )
+
+    # Auto-pin this position card so it's easy to find while the trade is
+    # open. If a card was already pinned for this position (e.g. from an
+    # earlier buy), unpin it first so only the latest card stays pinned.
+    old_pinned_chat_id = position_row.get("pinned_chat_id") if position_row else None
+    old_pinned_message_id = position_row.get("pinned_message_id") if position_row else None
+    if old_pinned_chat_id and old_pinned_message_id:
+        try:
+            await telegram_app.bot.unpin_chat_message(
+                chat_id=old_pinned_chat_id, message_id=old_pinned_message_id
+            )
+        except Exception:
+            logger.debug("Could not unpin previous position message", exc_info=True)
+    try:
+        await telegram_app.bot.pin_chat_message(
+            chat_id=sent_message.chat_id, message_id=sent_message.message_id, disable_notification=True
+        )
+        if position_row:
+            await db.update_position(
+                position_row["id"],
+                {"pinned_chat_id": sent_message.chat_id, "pinned_message_id": sent_message.message_id},
+            )
+    except Exception:
+        logger.debug("Could not pin new position message", exc_info=True)
 
     # Clean up the original "Buy" prompt (token card with buy buttons, or the
     # "send a custom amount" message) now that the trade confirmation is shown.
@@ -920,6 +944,13 @@ async def process_sell(
             telegram_app.bot, update.effective_chat.id, result, reason="manual",
             username=result.get("username", ""),
         )
+        pinned_chat_id = result.get("pinned_chat_id")
+        pinned_message_id = result.get("pinned_message_id")
+        if pinned_chat_id and pinned_message_id:
+            try:
+                await telegram_app.bot.unpin_chat_message(chat_id=pinned_chat_id, message_id=pinned_message_id)
+            except Exception:
+                logger.debug("Could not unpin closed position message", exc_info=True)
         if loading_query is not None:
             try:
                 await telegram_app.bot.delete_message(
@@ -1208,6 +1239,13 @@ async def check_tp_sl_triggers() -> None:
             reason="tp" if hit_tp else "sl",
             username=result.get("username", ""),
         )
+        pinned_chat_id = result.get("pinned_chat_id")
+        pinned_message_id = result.get("pinned_message_id")
+        if pinned_chat_id and pinned_message_id:
+            try:
+                await telegram_app.bot.unpin_chat_message(chat_id=pinned_chat_id, message_id=pinned_message_id)
+            except Exception:
+                logger.debug("Could not unpin auto-closed position message", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

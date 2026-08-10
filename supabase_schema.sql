@@ -67,3 +67,8 @@ create index if not exists idx_trades_user_id on trades(user_id);
 alter table if exists users add column if not exists buy_presets jsonb;
 alter table if exists users add column if not exists default_tp_multiple numeric;
 alter table if exists users add column if not exists default_sl_percent numeric;
+
+-- Safe to re-run: tracks the chat/message id of the currently-pinned
+-- position card, so it can be unpinned automatically when the position closes.
+alter table if exists positions add column if not exists pinned_chat_id bigint;
+alter table if exists positions add column if not exists pinned_message_id bigint;

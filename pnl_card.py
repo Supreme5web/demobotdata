@@ -246,12 +246,6 @@ def generate_pnl_card(trade: dict) -> str:
     status_label = trade.get("status_label") or "TRADE CLOSED"
     draw.text((x, y), status_label, font=header_font, fill=WHITE)
 
-    username = trade.get("username")
-    if username:
-        y += 34
-        handle = username if str(username).startswith("@") else f"@{username}"
-        draw.text((x, y), handle, font=_font(FONT_REGULAR, 24), fill=LABEL_GRAY)
-
     # --- Token identity (logo + name/symbol) -------------------------------
     y += 70
     logo_box = (x, y, x + LOGO_SIZE, y + LOGO_SIZE)
@@ -298,6 +292,17 @@ def generate_pnl_card(trade: dict) -> str:
     y += row_h
     _stat(draw, x, y, "DURATION", _format_duration(trade.get("duration_seconds", 0)),
           label_font=label_font, value_font=value_font)
+
+    # --- Username, bottom-right of the whole card ---------------------------
+    username = trade.get("username")
+    if username:
+        handle = username if str(username).startswith("@") else f"@{username}"
+        uname_font = _font(FONT_BOLD, 34)
+        text_w = draw.textlength(handle, font=uname_font)
+        margin = 50
+        ux = base.width - margin - text_w
+        uy = base.height - margin - uname_font.size
+        draw.text((ux, uy), handle, font=uname_font, fill=WHITE)
 
     # --- Composite + save -----------------------------------------------------
     final_img = Image.alpha_composite(base, overlay).convert("RGB")
