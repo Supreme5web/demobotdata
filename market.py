@@ -1,15 +1,14 @@
-"""Solana Tracker (solanatracker.io) Data API integration for token price/market data.
+"""DexScreener (dexscreener.com) API integration for token price/market data.
 
-Docs: https://docs.solanatracker.io - REST API at https://data.solanatracker.io,
-auth via an `x-api-key: <SOLANATRACKER_API_KEY>` header.
+Docs: https://docs.dexscreener.com/api/reference - REST API at
+https://api.dexscreener.com. This is a free, public API: no API key, no
+account, no auth header required.
 
 Solana-only: this bot no longer trades other chains, so every lookup here is
-keyed on a Solana mint address. `GET /tokens/{address}` returns full token
-metadata plus an array of `pools` (one per DEX/market the token trades on) -
-we use `pools[0]`, which the API returns as the primary/highest-liquidity
-pool. `GET /price?token=<mint>` is a lighter-weight single-value lookup, used
-for the frequent "what's SOL worth right now" calls (native-amount -> USD
-conversion) instead of pulling the full token payload each time.
+keyed on a Solana mint address. `GET /tokens/v1/solana/{address}` returns a
+plain JSON array of every trading pair (across every DEX) for that token -
+we pick the pair with the highest USD liquidity as the "primary" one, same
+approach as picking the top pool from Codex/Solana Tracker previously.
 
 Field paths are read defensively with _dig() so a renamed/missing field
 degrades to 0 instead of raising - this should never crash a trade.
@@ -20,28 +19,21 @@ from typing import Optional
 
 import httpx
 
-from config import SOLANATRACKER_API_KEY, SOL_MINT_ADDRESS, DEFAULT_SOL_PRICE_FALLBACK
+from config import SOL_MINT_ADDRESS, DEFAULT_SOL_PRICE_FALLBACK
 
 logger = logging.getLogger(__name__)
 
-SOLANATRACKER_BASE_URL = "https://data.solanatracker.io"
-_HEADERS = {"x-api-key": SOLANATRACKER_API_KEY}
+DEXSCREENER_BASE_URL = "https://api.dexscreener.com"
 
 
 def _dig(d: dict, *paths, default=0):
-    """Tries each dotted path (e.g. 'pools.0.price.usd') against `d` in
-    order and returns the first value found that isn't None. Never raises."""
+    """Tries each dotted path (e.g. 'liquidity.usd') against `d` in order
+    and returns the first value found that isn't None. Never raises."""
     for path in paths:
         node = d
         ok = True
         for key in path.split("."):
-            if isinstance(node, list):
-                try:
-                    node = node[int(key)]
-                except (ValueError, IndexError):
-                    ok = False
-                    break
-            elif isinstance(node, dict) and key in node:
+            if isinstance(node, dict) and key in node:
                 node = node[key]
             else:
                 ok = False
@@ -51,63 +43,69 @@ def _dig(d: dict, *paths, default=0):
     return default
 
 
-async def _get(path: str, params: Optional[dict] = None) -> Optional[dict]:
+async def _get_pairs(token_address: str) -> list:
+    """GET /tokens/v1/solana/{address} - returns a bare JSON array of pair
+    objects (one per DEX pool this token trades on), or an empty list if
+    the token isn't found / the request fails."""
+    url = f"{DEXSCREENER_BASE_URL}/tokens/v1/solana/{token_address}"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{SOLANATRACKER_BASE_URL}{path}",
-                headers=_HEADERS,
-                params=params,
-            )
+            resp = await client.get(url)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
-        logger.error("Solana Tracker API request failed (%s): %s", path, exc)
+        logger.error("DexScreener API request failed (%s): %s", token_address, exc)
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _best_pair(pairs: list) -> Optional[dict]:
+    """Picks the highest-liquidity pair out of every DEX pool returned for
+    a token - mirrors how Codex/Solana Tracker surfaced a single "primary"
+    pool per token."""
+    if not pairs:
         return None
+    return max(pairs, key=lambda p: float(_dig(p, "liquidity.usd", default=0) or 0))
 
 
 async def get_token_data(token_address: str, chain: str = "sol") -> Optional[dict]:
-    """Fetch token info from Solana Tracker for a given mint address.
-    Returns None if the token can't be found / the request fails.
+    """Fetch token info from DexScreener for a given mint address. Returns
+    None if the token can't be found / the request fails.
 
     `chain` is accepted for call-site compatibility with the rest of the
     codebase (which still threads a `chain` argument through everywhere)
     but is otherwise unused - this bot is Solana-only.
     """
-    data = await _get(f"/tokens/{token_address}")
-    if not data:
-        return None
-
-    # pools[0] is the primary (highest-liquidity) pool for this token.
-    if not _dig(data, "pools.0"):
+    pairs = await _get_pairs(token_address)
+    pair = _best_pair(pairs)
+    if not pair:
         return None
 
     try:
-        price_usd = float(_dig(data, "pools.0.price.usd", default=0) or 0)
+        price_usd = float(_dig(pair, "priceUsd", default=0) or 0)
     except (TypeError, ValueError):
         price_usd = 0.0
 
-    market_cap = _dig(data, "pools.0.marketCap.usd", default=0)
-    liquidity_usd = _dig(data, "pools.0.liquidity.usd", default=0)
-    volume_24h = _dig(data, "pools.0.txns.volume24h", "pools.0.txns.volume", default=0)
-    price_change_1h = _dig(data, "events.1h.priceChangePercentage", default=0)
+    market_cap = _dig(pair, "marketCap", "fdv", default=0)
+    liquidity_usd = _dig(pair, "liquidity.usd", default=0)
+    volume_24h = _dig(pair, "volume.h24", default=0)
+    price_change_1h = _dig(pair, "priceChange.h1", default=0)
 
-    token = data.get("token") or {}
+    base_token = pair.get("baseToken") or {}
 
     return {
         "token_address": token_address,
         "chain": "sol",
-        "name": token.get("name") or "Unknown Token",
-        "symbol": token.get("symbol") or "???",
+        "name": base_token.get("name") or "Unknown Token",
+        "symbol": base_token.get("symbol") or "???",
         "price_usd": price_usd,
         "market_cap": market_cap or 0,
         "liquidity_usd": liquidity_usd or 0,
         "volume_24h": volume_24h or 0,
         "price_change_1h": price_change_1h or 0,
-        "pair_address": _dig(data, "pools.0.poolId", default=""),
-        "dex_url": "",  # Solana Tracker doesn't return a ready-made chart
-                         # link; main.py falls back to the chain's explorer page.
-        "logo_url": token.get("image") or "",
+        "pair_address": pair.get("pairAddress") or "",
+        "dex_url": pair.get("url") or "",
+        "logo_url": _dig(pair, "info.imageUrl", default=""),
     }
 
 
@@ -127,14 +125,9 @@ async def get_native_price(chain: str = "sol") -> float:
     `chain` is accepted for call-site compatibility (see get_token_data)
     but is otherwise unused - this bot only ever prices SOL.
     """
-    data = await _get("/price", params={"token": SOL_MINT_ADDRESS})
-    if data:
-        try:
-            price = float(data.get("price") or 0)
-        except (TypeError, ValueError):
-            price = 0.0
-        if price > 0:
-            return price
+    data = await get_token_data(SOL_MINT_ADDRESS)
+    if data and data["price_usd"] > 0:
+        return data["price_usd"]
 
     logger.warning(
         "Could not fetch live SOL price, using fallback of $%s",

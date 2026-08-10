@@ -9,7 +9,6 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-SOLANATRACKER_API_KEY = os.getenv("SOLANATRACKER_API_KEY")
 
 # App constants
 STARTING_BALANCE_SOL = 10.0
@@ -20,9 +19,10 @@ DEFAULT_SOL_PRICE_FALLBACK = 150.0
 # ---------------------------------------------------------------------------
 # Chains
 # ---------------------------------------------------------------------------
-# This bot is Solana-only. Market data comes from Solana Tracker's Data API
-# (https://data.solanatracker.io, docs: https://docs.solanatracker.io),
-# SOLANATRACKER_API_KEY required, which identifies tokens by mint address.
+# This bot is Solana-only. Market data comes from DexScreener's free,
+# public API (https://api.dexscreener.com, docs:
+# https://docs.dexscreener.com/api/reference) - no API key required, which
+# identifies tokens by mint address.
 #
 # A single-entry CHAINS dict is kept (rather than inlining these values)
 # because trading.py, database.py, and main.py all thread a `chain` argument
@@ -35,7 +35,7 @@ CHAINS = {
         "native_symbol": "SOL",
         "buy_presets": [0.1, 0.5, 0.6, 1],
         "fallback_native_price": DEFAULT_SOL_PRICE_FALLBACK,
-        "explorer_url": "https://www.solanatracker.io/token/{address}",
+        "explorer_url": "https://dexscreener.com/solana/{address}",
     },
 }
 
@@ -45,7 +45,6 @@ REQUIRED_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_KEY": SUPABASE_KEY,
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
-    "SOLANATRACKER_API_KEY": SOLANATRACKER_API_KEY,
 }
 
 missing = [name for name, value in REQUIRED_VARS.items() if not value]
