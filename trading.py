@@ -4,7 +4,7 @@ import logging
 
 import database as db
 import market
-from config import CHAINS, DEFAULT_CHAIN
+from config import DEFAULT_CHAIN
 
 logger = logging.getLogger(__name__)
 
@@ -13,9 +13,11 @@ class TradingError(Exception):
     """Raised for user-facing trading failures (insufficient balance, bad price, etc.)."""
 
 
-async def execute_buy(user: dict, token_address: str, native_amount: float, chain: str = DEFAULT_CHAIN) -> dict:
-    """Buy a token using an amount denominated in the chain's native gas
-    token (SOL / ETH / BNB), converted to demo USD.
+async def execute_buy(user: dict, token_address: str, usdc_amount: float, chain: str = DEFAULT_CHAIN) -> dict:
+    """Buy a token using an amount denominated in USDC, the bot's demo
+    trading currency. USDC is pegged 1:1 to USD, so - unlike a chain's
+    native gas token (SOL/BNB/ETH), whose USD value moves - the amount
+    needs no price lookup or conversion; it's spent as-is.
 
     If the user already holds this token on this chain, this DCAs into the
     existing position: the new buy's cost is added to invested_amount, and
@@ -24,22 +26,20 @@ async def execute_buy(user: dict, token_address: str, native_amount: float, chai
     or Nth) buy always reflects the true blended average entry rather than
     just the latest fill price.
     """
-    if native_amount <= 0:
+    if usdc_amount <= 0:
         raise TradingError("Amount must be greater than zero.")
 
     token_data = await market.get_token_data(token_address, chain)
     if not token_data or token_data["price_usd"] <= 0:
         raise TradingError("Could not fetch a valid price for this token right now.")
 
-    native_price = await market.get_native_price(chain)
-    usd_amount = native_amount * native_price
+    usd_amount = usdc_amount  # USDC is 1:1 with USD - no conversion needed.
 
     balance = float(user["balance"])
     if usd_amount > balance:
-        symbol = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["native_symbol"]
         raise TradingError(
-            f"Insufficient demo balance. You have ${balance:,.2f}, "
-            f"this trade needs ~${usd_amount:,.2f} ({native_amount:g} {symbol})."
+            f"Insufficient demo balance. You have {balance:,.2f} USDC, "
+            f"this trade needs {usd_amount:,.2f} USDC."
         )
 
     entry_price = token_data["price_usd"]
@@ -126,7 +126,7 @@ async def execute_buy(user: dict, token_address: str, native_amount: float, chai
         "token_symbol": token_data["symbol"],
         "token_address": token_address,
         "chain": chain,
-        "native_amount": native_amount,
+        "usdc_amount": usdc_amount,
         "usd_amount": usd_amount,
         "entry_price": entry_price,
         "entry_market_cap": entry_market_cap,

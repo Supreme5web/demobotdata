@@ -1,7 +1,9 @@
 """Telegram bot + FastAPI server for PaperBoat - Demo Trading Bot.
 
 No wallets, no private keys, no real transactions - everything here trades
-against a virtual USD balance stored in Supabase. Solana only.
+against a virtual USDC balance stored in Supabase. Solana, BSC, and
+Robinhood Chain, auto-detected from the shape (and, for the two EVM chains,
+a live DexScreener lookup) of whatever contract address the user sends.
 """
 
 import asyncio
@@ -11,6 +13,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import FastAPI
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -40,6 +43,35 @@ logger = logging.getLogger(__name__)
 
 # Base58, 32-44 chars - matches typical Solana addresses.
 SOLANA_CA_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+# 0x + 40 hex chars - standard EVM address format, shared by every EVM chain
+# this bot supports (BSC, Robinhood Chain), so it can't tell them apart on
+# its own - see resolve_chain() below.
+EVM_CA_REGEX = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+async def resolve_chain(token_address: str) -> tuple[Optional[str], Optional[dict]]:
+    """Auto-detects which chain a pasted contract address belongs to and
+    returns (chain, token_data) - or (None, None) if it doesn't look like a
+    supported address, or isn't listed on any candidate chain.
+
+    Solana and EVM addresses have different shapes and never collide, but
+    BSC and Robinhood Chain are both EVM chains sharing the same 0x-hex
+    format, so the shape alone can't disambiguate them. Instead, every
+    "evm"-kind chain is queried on DexScreener and whichever one actually
+    has this token listed (i.e. returns a real price) wins.
+    """
+    if SOLANA_CA_REGEX.match(token_address):
+        candidates = [c for c, cfg in CHAINS.items() if cfg["address_kind"] == "solana"]
+    elif EVM_CA_REGEX.match(token_address):
+        candidates = [c for c, cfg in CHAINS.items() if cfg["address_kind"] == "evm"]
+    else:
+        return None, None
+
+    for chain in candidates:
+        token_data = await market.get_token_data(token_address, chain)
+        if token_data and token_data["price_usd"] > 0:
+            return chain, token_data
+    return None, None
 
 # Take-profit presets, expressed as a multiple of entry market cap (e.g. "2" = 2x).
 TP_PRESETS = [2, 3, 5, 10]
@@ -53,15 +85,6 @@ SL_PRESETS = [10, 20, 30, 50]
 
 def fmt_usd(value) -> str:
     return f"${float(value or 0):,.2f}"
-
-
-def fmt_native(value, chain: str) -> str:
-    symbol = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["native_symbol"]
-    return f"{float(value or 0):,.4f} {symbol}"
-
-
-def fmt_sol(value) -> str:
-    return fmt_native(value, "sol")
 
 
 def chain_label(chain: str) -> str:
@@ -156,13 +179,10 @@ async def get_user(update: Update) -> dict:
 
 
 async def balance_block(user: dict) -> str:
-    """Renders the demo balance in both USD and its live SOL equivalent.
-    The demo balance itself is chain-agnostic USD, shared across every
-    chain the user trades on."""
+    """Renders the demo balance. It's held in USDC (pegged 1:1 to USD) and
+    is chain-agnostic, shared across every chain the user trades on."""
     usd_balance = float(user["balance"])
-    sol_price = await market.get_sol_price()
-    sol_equiv = usd_balance / sol_price if sol_price else 0.0
-    return f"💰 Balance: <b>{fmt_usd(usd_balance)}</b>\n≈ {fmt_sol(sol_equiv)}"
+    return f"💰 Balance: <b>{fmt_usd(usd_balance)} USDC</b>"
 
 
 def tp_sl_line(entry_price: float, entry_mcap: float, tp_price, sl_price) -> str:
@@ -198,7 +218,6 @@ def format_position_card(
     pnl_pct: float,
     tp_price=None,
     sl_price=None,
-    dca_note: str = "",
 ) -> str:
     """Render a clean, refreshable position summary keyed on market cap."""
     timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
@@ -207,7 +226,6 @@ def format_position_card(
 
     return (
         f"📌 <b>{html.escape(name)}</b> ({html.escape(symbol)}) · {html.escape(chain_label(chain))}\n"
-        f"{dca_note}\n"
         f"Entry: <b>{fmt_compact(entry_mcap)}</b>\n"
         f"Current: <b>{fmt_compact(current_market_cap)}</b>\n"
         f"💵 Invested: {fmt_usd(invested)}\n\n"
@@ -228,7 +246,7 @@ def build_position_keyboard(token_address: str, chain: str) -> InlineKeyboardMar
     buy_rows = [
         [
             InlineKeyboardButton(
-                f"➕ Buy {amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}"
+                f"➕ Buy ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}"
             )
             for amt in presets[i : i + 2]
         ]
@@ -337,12 +355,13 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "🚤 <b>PAPERBOAT</b> — Demo Trading Bot\n"
         "Practice trading with real market data and zero risk.\n"
         "No wallet. No private keys. No real funds.\n"
-        "All trades are simulated with a demo balance.\n\n"
-        f"⛓ Chain: {chain_label(DEFAULT_CHAIN)}\n\n"
+        "All trades are simulated with a demo USDC balance.\n\n"
+        "⛓ Chains: Solana, BSC & Robinhood Chain (auto-detected)\n\n"
         f"{balance_line}\n\n"
-        "📩 Send a Solana token contract address to view live data and trade.\n"
+        "📩 Send a token contract address to view live data and trade - "
+        "the chain is detected automatically from the address.\n"
         "➕ Already holding a token? Tap Buy again on its position card to "
-        "DCA in - your average entry updates automatically.\n"
+        "add to it - your average entry updates automatically.\n"
         "🎯 Set Take Profit / Stop Loss and let PaperBoat manage your "
         "positions automatically.\n\n"
         "<b>Commands:</b>\n"
@@ -481,7 +500,7 @@ def build_token_info_keyboard(token_address: str, chain: str, dex_url: str = "")
     presets = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
     keyboard = [
         [
-            InlineKeyboardButton(f"BUY {amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}")
+            InlineKeyboardButton(f"BUY ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}")
             for amt in presets[i : i + 2]
         ]
         for i in range(0, len(presets), 2)
@@ -498,8 +517,9 @@ def build_token_info_keyboard(token_address: str, chain: str, dex_url: str = "")
     return InlineKeyboardMarkup(keyboard)
 
 
-async def show_token_info(target, token_address: str, chain: str) -> None:
-    token_data = await market.get_token_data(token_address, chain)
+async def show_token_info(target, token_address: str, chain: str, token_data: Optional[dict] = None) -> None:
+    if token_data is None:
+        token_data = await market.get_token_data(token_address, chain)
     if not token_data:
         await target.reply_text(
             f"⚠️ Couldn't find that token on {chain_label(chain)}. Double check the contract address."
@@ -540,11 +560,11 @@ async def process_refresh_token(query, chain: str, token_address: str) -> None:
     await query.answer("Updated")
 
 
-async def process_buy(update: Update, target, token_address: str, native_amount: float, chain: str,
+async def process_buy(update: Update, target, token_address: str, usdc_amount: float, chain: str,
                        delete_chat_id=None, delete_message_id=None) -> None:
     user = await get_user(update)
     try:
-        result = await trading.execute_buy(user, token_address, native_amount, chain)
+        result = await trading.execute_buy(user, token_address, usdc_amount, chain)
     except trading.TradingError as exc:
         await target.reply_text(f"⚠️ {exc}")
         return
@@ -558,13 +578,6 @@ async def process_buy(update: Update, target, token_address: str, native_amount:
     position_row = await db.get_position(user["id"], token_address, chain)
     tp_price = position_row.get("tp_price") if position_row else None
     sl_price = position_row.get("sl_price") if position_row else None
-
-    dca_note = ""
-    if result.get("is_dca"):
-        dca_note = (
-            f"➕ <i>DCA'd in {fmt_native(result['native_amount'], chain)} "
-            f"({fmt_usd(result['usd_amount'])}) — new avg entry below</i>\n"
-        )
 
     text = format_position_card(
         name=result["token_name"],
@@ -580,7 +593,6 @@ async def process_buy(update: Update, target, token_address: str, native_amount:
         pnl_pct=0.0,
         tp_price=tp_price,
         sl_price=sl_price,
-        dca_note=dca_note,
     )
     await target.reply_text(
         text,
@@ -752,9 +764,6 @@ async def process_sell(
         await _fail("⚠️ Something went wrong processing that trade. Please try again.")
         return
 
-    sol_price = await market.get_sol_price()
-    new_balance_sol = result["new_balance"] / sol_price if sol_price else 0.0
-
     if result.get("position_closed"):
         # Full close: the PNL card image is the confirmation. Drop it in the
         # chat, then remove the loading placeholder now that it's served its purpose.
@@ -777,8 +786,7 @@ async def process_sell(
         f"Received: {fmt_usd(result['proceeds'])}\n\n"
         f"PNL: <b>{pnl_symbol(result['pnl'])} {fmt_usd(result['pnl'])} "
         f"({result['pnl_pct']:+.2f}%)</b>\n\n"
-        f"💰 Balance: {fmt_usd(result['new_balance'])} "
-        f"<i>(≈ {fmt_sol(new_balance_sol)})</i>"
+        f"💰 Balance: {fmt_usd(result['new_balance'])} USDC"
     )
     if loading_query is not None:
         try:
@@ -856,8 +864,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         return
 
-    if SOLANA_CA_REGEX.match(text):
-        await show_token_info(update.message, text, "sol")
+    if SOLANA_CA_REGEX.match(text) or EVM_CA_REGEX.match(text):
+        chain, token_data = await resolve_chain(text)
+        if chain:
+            await show_token_info(update.message, text, chain, token_data)
+        else:
+            await update.message.reply_text(
+                "⚠️ Couldn't find that token on Solana, BSC, or Robinhood Chain. "
+                "Double check the contract address."
+            )
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -885,8 +900,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "chat_id": query.message.chat_id,
             "message_id": query.message.message_id,
         }
-        symbol = CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["native_symbol"]
-        await query.message.reply_text(f"Send the amount of {symbol} you'd like to spend, e.g. 0.75")
+        await query.message.reply_text("Send the amount of USDC you'd like to spend, e.g. 100")
     elif action == "sell" and len(parts) == 4:
         await query.answer()
         chain, token_address, percent_str = parts[1], parts[2], parts[3]

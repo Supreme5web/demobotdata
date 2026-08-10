@@ -10,8 +10,7 @@ from typing import Optional
 
 from supabase import create_client, Client
 
-import market
-from config import SUPABASE_URL, SUPABASE_KEY, STARTING_BALANCE_SOL
+from config import SUPABASE_URL, SUPABASE_KEY, STARTING_BALANCE_USDC
 
 logger = logging.getLogger(__name__)
 
@@ -41,21 +40,19 @@ async def get_or_create_user(telegram_id: int, username: Optional[str]) -> dict:
     if existing:
         return existing
 
-    # New user: seed their demo balance with the USD value of
-    # STARTING_BALANCE_SOL at the current live SOL price.
-    sol_price = await market.get_sol_price()
-    starting_balance = STARTING_BALANCE_SOL * sol_price
-
+    # New user: seed their demo balance with a flat starting amount of the
+    # bot's demo trading currency, USDC (pegged 1:1 to USD, so no price
+    # lookup is needed here).
     def _insert():
         new_user = {
             "telegram_id": telegram_id,
             "username": username or "",
-            "balance": starting_balance,
+            "balance": STARTING_BALANCE_USDC,
         }
         insert_res = supabase.table("users").insert(new_user).execute()
         logger.info(
-            "Created new user for telegram_id=%s with starting balance $%.2f (%.2f SOL @ $%.2f)",
-            telegram_id, starting_balance, STARTING_BALANCE_SOL, sol_price,
+            "Created new user for telegram_id=%s with starting balance %.2f USDC",
+            telegram_id, STARTING_BALANCE_USDC,
         )
         return insert_res.data[0]
 

@@ -4,11 +4,17 @@ Docs: https://docs.dexscreener.com/api/reference - REST API at
 https://api.dexscreener.com. This is a free, public API: no API key, no
 account, no auth header required.
 
-Solana-only: this bot no longer trades other chains, so every lookup here is
-keyed on a Solana mint address. `GET /tokens/v1/solana/{address}` returns a
-plain JSON array of every trading pair (across every DEX) for that token -
-we pick the pair with the highest USD liquidity as the "primary" one, same
-approach as picking the top pool from Codex/Solana Tracker previously.
+Multi-chain: every lookup here is keyed on (DexScreener chain slug, token
+address), where the slug comes from CHAINS[chain]["dexscreener_chain_id"]
+(e.g. "solana", "bsc", "robinhood"). `GET /tokens/v1/{slug}/{address}`
+returns a plain JSON array of every trading pair (across every DEX) for
+that token - we pick the pair with the highest USD liquidity as the
+"primary" one, same approach as picking the top pool from Codex/Solana
+Tracker previously.
+
+The bot's demo trading currency is USDC, which is pegged 1:1 to USD, so
+unlike a chain's native gas token there's no price to fetch or convert -
+trading.py just treats a USDC amount as an equal USD amount directly.
 
 Field paths are read defensively with _dig() so a renamed/missing field
 degrades to 0 instead of raising - this should never crash a trade.
@@ -19,11 +25,15 @@ from typing import Optional
 
 import httpx
 
-from config import SOL_MINT_ADDRESS, DEFAULT_SOL_PRICE_FALLBACK
+from config import CHAINS, DEFAULT_CHAIN
 
 logger = logging.getLogger(__name__)
 
 DEXSCREENER_BASE_URL = "https://api.dexscreener.com"
+
+
+def _chain_cfg(chain: str) -> dict:
+    return CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])
 
 
 def _dig(d: dict, *paths, default=0):
@@ -43,18 +53,19 @@ def _dig(d: dict, *paths, default=0):
     return default
 
 
-async def _get_pairs(token_address: str) -> list:
-    """GET /tokens/v1/solana/{address} - returns a bare JSON array of pair
-    objects (one per DEX pool this token trades on), or an empty list if
-    the token isn't found / the request fails."""
-    url = f"{DEXSCREENER_BASE_URL}/tokens/v1/solana/{token_address}"
+async def _get_pairs(token_address: str, chain: str) -> list:
+    """GET /tokens/v1/{dexscreener_chain_id}/{address} - returns a bare JSON
+    array of pair objects (one per DEX pool this token trades on), or an
+    empty list if the token isn't found / the request fails."""
+    slug = _chain_cfg(chain)["dexscreener_chain_id"]
+    url = f"{DEXSCREENER_BASE_URL}/tokens/v1/{slug}/{token_address}"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             data = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
-        logger.error("DexScreener API request failed (%s): %s", token_address, exc)
+        logger.error("DexScreener API request failed (%s/%s): %s", chain, token_address, exc)
         return []
     return data if isinstance(data, list) else []
 
@@ -68,15 +79,11 @@ def _best_pair(pairs: list) -> Optional[dict]:
     return max(pairs, key=lambda p: float(_dig(p, "liquidity.usd", default=0) or 0))
 
 
-async def get_token_data(token_address: str, chain: str = "sol") -> Optional[dict]:
-    """Fetch token info from DexScreener for a given mint address. Returns
-    None if the token can't be found / the request fails.
-
-    `chain` is accepted for call-site compatibility with the rest of the
-    codebase (which still threads a `chain` argument through everywhere)
-    but is otherwise unused - this bot is Solana-only.
-    """
-    pairs = await _get_pairs(token_address)
+async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[dict]:
+    """Fetch token info from DexScreener for a given token address on the
+    given chain (see CHAINS in config.py for supported chains). Returns
+    None if the token can't be found / the request fails."""
+    pairs = await _get_pairs(token_address, chain)
     pair = _best_pair(pairs)
     if not pair:
         return None
@@ -95,7 +102,7 @@ async def get_token_data(token_address: str, chain: str = "sol") -> Optional[dic
 
     return {
         "token_address": token_address,
-        "chain": "sol",
+        "chain": chain,
         "name": base_token.get("name") or "Unknown Token",
         "symbol": base_token.get("symbol") or "???",
         "price_usd": price_usd,
@@ -109,33 +116,8 @@ async def get_token_data(token_address: str, chain: str = "sol") -> Optional[dic
     }
 
 
-async def get_current_price(token_address: str, chain: str = "sol") -> Optional[float]:
+async def get_current_price(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[float]:
     data = await get_token_data(token_address, chain)
     if data and data["price_usd"] > 0:
         return data["price_usd"]
     return None
-
-
-async def get_native_price(chain: str = "sol") -> float:
-    """Fetch the current USD price of SOL, used to convert BUY button
-    amounts (denominated in SOL) into demo USD balance deductions. Falls
-    back to a hardcoded estimate if the live lookup fails, so a market-data
-    hiccup never blocks a trade outright.
-
-    `chain` is accepted for call-site compatibility (see get_token_data)
-    but is otherwise unused - this bot only ever prices SOL.
-    """
-    data = await get_token_data(SOL_MINT_ADDRESS)
-    if data and data["price_usd"] > 0:
-        return data["price_usd"]
-
-    logger.warning(
-        "Could not fetch live SOL price, using fallback of $%s",
-        DEFAULT_SOL_PRICE_FALLBACK,
-    )
-    return DEFAULT_SOL_PRICE_FALLBACK
-
-
-# Backwards-compatible alias - existing callers can keep calling this.
-async def get_sol_price() -> float:
-    return await get_native_price("sol")
