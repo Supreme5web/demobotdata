@@ -81,10 +81,22 @@ async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[d
     been fully populated yet - DexPaprika's own site flags this explicitly
     for very new chains (e.g. Robinhood Chain, live since July 2026):
     "Summary is present but summary.price_usd is missing, non-finite, or
-    zero." The flat /search endpoint has been observed to carry real
-    price/liquidity numbers for the same token even when the summary
-    endpoint doesn't yet, so it's worth a second try before giving up.
-    Returns the matching flat token dict, or None if no match / failure."""
+    zero." Also used when summary.24h.volume_usd is missing/zero, which
+    happens independently of price.
+
+    Important: /search splits its response into three arrays, and only
+    two of them carry market data. data["tokens"] is identity-only (name,
+    symbol, decimals, fdv - no price/volume/liquidity at all). The actual
+    price_usd/volume_usd numbers live on data["pools"], keyed per pool, so
+    a pool only "matches" our token if our token address appears in that
+    pool's own `tokens` list. Reading price/volume off a token dict (as
+    if /search worked like /tokens/{address}) silently returns nothing,
+    which is why volume was defaulting to 0 for otherwise-healthy tokens.
+
+    This merges the token's identity fields with the market data from
+    whichever matching pool has the highest volume_usd (the pool
+    DexPaprika's own site would treat as the token's primary pool).
+    Returns None if nothing in either array matches."""
     network = _chain_cfg(chain)["dexpaprika_network_id"]
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -95,10 +107,30 @@ async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[d
         logger.error("DexPaprika /search fallback failed (%s/%s): %s", chain, token_address, exc)
         return None
 
+    token_meta = None
     for token in data.get("tokens", []):
         if token.get("chain") == network and str(token.get("id", "")).lower() == token_address.lower():
-            return token
-    return None
+            token_meta = token
+            break
+
+    matching_pools = [
+        pool for pool in data.get("pools", [])
+        if pool.get("chain") == network
+        and any(str(t.get("id", "")).lower() == token_address.lower() for t in pool.get("tokens", []))
+    ]
+    best_pool = max(matching_pools, key=lambda p: float(p.get("volume_usd") or 0), default=None)
+
+    if token_meta is None and best_pool is None:
+        return None
+
+    merged = dict(token_meta or {})
+    if best_pool:
+        # Only fill price from the pool if the token entry didn't already
+        # have one (it never does today, but this keeps identity fields
+        # authoritative over pool fields if that ever changes).
+        merged.setdefault("price_usd", best_pool.get("price_usd"))
+        merged["volume_usd"] = best_pool.get("volume_usd")
+    return merged
 
 
 def _dexscreener_chain_slug(chain: str) -> str:
@@ -199,24 +231,28 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
     if price_change_1h is None:
         price_change_1h = 0
 
-    if price_usd <= 0:
-        # Summary endpoint came back empty on price - try the /search
-        # fallback before giving up (see _query_dexpaprika_search docstring).
+    if price_usd <= 0 or not volume_24h:
+        # Summary endpoint came back empty on price and/or volume - try the
+        # /search fallback before giving up (see _query_dexpaprika_search
+        # docstring). These two are independent: a token can have a valid
+        # price but a missing/zero summary.24h.volume_usd, so this triggers
+        # on either gap rather than only on price.
         fallback = await _query_dexpaprika_search(token_address, chain)
         if fallback:
-            try:
-                price_usd = float(fallback.get("price_usd") or 0)
-            except (TypeError, ValueError):
-                price_usd = 0.0
+            if price_usd <= 0:
+                try:
+                    price_usd = float(fallback.get("price_usd") or 0)
+                except (TypeError, ValueError):
+                    price_usd = 0.0
             if not market_cap:
                 market_cap = fallback.get("fdv_usd") or fallback.get("fdv") or 0
             if not liquidity_usd:
                 liquidity_usd = fallback.get("liquidity_usd") or 0
             if not volume_24h:
                 volume_24h = fallback.get("volume_usd") or fallback.get("volume_usd_24h") or 0
-            if price_usd > 0:
+            if price_usd > 0 or volume_24h:
                 logger.info(
-                    "DexPaprika summary lacked price for %s/%s - used /search fallback instead.",
+                    "DexPaprika summary lacked price/volume for %s/%s - used /search fallback instead.",
                     chain, token_address,
                 )
 
