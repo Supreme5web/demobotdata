@@ -96,96 +96,86 @@ async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[d
 
 
 
-def _select_matching_pool(token_price: float, pools: list) -> dict | None:
-    """Select the pool whose price is closest to the token-level DexPaprika price."""
-    if not pools or token_price <= 0:
-        return None
-
-    candidates = []
-    for pool in pools:
-        try:
-            pool_price = float(pool.get("price_usd") or 0)
-            if pool_price <= 0:
-                continue
-
-            # Compare on a logarithmic scale so wildly different prices
-            # (e.g. 75 vs 0.00001) are rejected reliably.
-            ratio = max(pool_price, token_price) / min(pool_price, token_price)
-            candidates.append((ratio, pool))
-        except (TypeError, ValueError):
-            continue
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda x: x[0])
-    return candidates[0][1]
+def _logo_url(token_address: str, chain: str) -> str:
+    """Return a stable token-logo URL for chains supported by DexScreener's
+    public token-image CDN. DexPaprika provides has_image but not the image URL.
+    """
+    chain_slug = {"sol": "solana", "bsc": "bsc", "robinhood": "robinhood"}.get(chain, chain)
+    return f"https://dd.dexscreener.com/ds-data/tokens/{chain_slug}/{token_address}.png"
 
 
 async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[dict]:
-    """Fetch token data and select the pool that matches the token price."""
-    network = _normalize_chain(chain)
-    url = f"{BASE_URL}/networks/{network}/tokens/{token_address}"
+    """Fetch token info from DexPaprika for a given token address on the
+    given chain (see CHAINS in config.py for supported chains). Returns
+    None if the token can't be found / the request fails."""
+    result = await _query_dexpaprika(token_address, chain)
+    if not result:
+        return None
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        data = response.json()
+    try:
+        price_usd = float(_dig(result, "summary.price_usd", default=0) or 0)
+    except (TypeError, ValueError):
+        price_usd = 0.0
 
-        token = data.get("tokens", [{}])[0] if data.get("tokens") else {}
-        token_price = float(token.get("price_usd") or 0)
-        pools = data.get("pools") or []
+    # DexPaprika doesn't expose a separate circulating market cap field -
+    # "fdv" (fully diluted valuation = price * total supply) is the closest
+    # equivalent and is what most memecoin trackers show as "MCap" anyway.
+    market_cap = _dig(result, "summary.fdv", default=0)
+    liquidity_usd = _dig(result, "summary.liquidity_usd", default=0)
+    volume_24h = _dig(result, "summary.24h.volume_usd", default=0)
+    price_change_1h = _dig(result, "summary.1h.last_price_usd_change", "summary.1h.price_change", default=None)
 
-        # Fetch /search as well because the pool-level response contains
-        # 5m/1h/24h price changes. Select the pool whose price matches
-        # the token-level price rather than blindly taking pools[0].
-        search_data = {}
-        try:
-            search_response = await client.get(
-                f"{BASE_URL}/search",
-                params={"query": token_address},
-            )
-            if search_response.is_success:
-                search_data = search_response.json()
-                search_pools = search_data.get("pools") or []
-                if search_pools:
-                    pools = search_pools
-        except Exception:
-            pass
+    # DexPaprika also exposes 1h percentage changes on individual pools.
+    # Pick the highest-volume pool that has a non-null 1h change.
+    if price_change_1h is None:
+        pools = result.get("pools") or []
+        candidates = [p for p in pools if p.get("last_price_change_usd_1h") is not None]
+        if candidates:
+            best_pool = max(candidates, key=lambda p: float(p.get("volume_usd") or 0))
+            price_change_1h = best_pool.get("last_price_change_usd_1h")
+    if price_change_1h is None:
+        price_change_1h = 0
 
-        matching_pool = _select_matching_pool(token_price, pools)
+    if price_usd <= 0:
+        # Summary endpoint came back empty on price - try the /search
+        # fallback before giving up (see _query_dexpaprika_search docstring).
+        fallback = await _query_dexpaprika_search(token_address, chain)
+        if fallback:
+            try:
+                price_usd = float(fallback.get("price_usd") or 0)
+            except (TypeError, ValueError):
+                price_usd = 0.0
+            if not market_cap:
+                market_cap = fallback.get("fdv_usd") or fallback.get("fdv") or 0
+            if not liquidity_usd:
+                liquidity_usd = fallback.get("liquidity_usd") or 0
+            if not volume_24h:
+                volume_24h = fallback.get("volume_usd") or fallback.get("volume_usd_24h") or 0
+            if price_usd > 0:
+                logger.info(
+                    "DexPaprika summary lacked price for %s/%s - used /search fallback instead.",
+                    chain, token_address,
+                )
 
-        change_5m = None
-        change_1h = None
-        change_24h = None
+    return {
+        "token_address": token_address,
+        "chain": chain,
+        "name": result.get("name") or "Unknown Token",
+        "symbol": result.get("symbol") or "???",
+        "price_usd": price_usd,
+        "market_cap": market_cap or 0,
+        "liquidity_usd": liquidity_usd or 0,
+        "volume_24h": volume_24h or 0,
+        "price_change_1h": price_change_1h or 0,
+        "pair_address": "",
+        "dex_url": "",
+        # DexPaprika's token endpoint only returns a `has_image` boolean, not
+        # a usable image URL, so this stays empty - pnl_card.py already
+        # falls back to a letter badge when no logo is available.
+        "logo_url": _logo_url(token_address, chain),
+    }
 
-        if matching_pool:
-            change_5m = matching_pool.get("last_price_change_usd_5m")
-            change_1h = matching_pool.get("last_price_change_usd_1h")
-            change_24h = matching_pool.get("last_price_change_usd_24h")
 
-        # Keep token-level volume/liquidity because token volume aggregates
-        # the relevant pools, while pool volume represents only one pool.
-        volume_usd = float(token.get("volume_usd") or 0)
-        liquidity_usd = float(token.get("liquidity_usd") or 0)
-
-        # PaperBoat uses the standard 1B circulating supply assumption.
-        market_cap = token_price * 1_000_000_000 if token_price > 0 else 0
-
-        return {
-            "name": token.get("name") or "",
-            "symbol": token.get("symbol") or "",
-            "price_usd": token_price,
-            "market_cap": market_cap,
-            "liquidity_usd": liquidity_usd,
-            "volume_usd": volume_usd,
-            "price_change_5m": float(change_5m) if change_5m is not None else 0.0,
-            "price_change_1h": float(change_1h) if change_1h is not None else 0.0,
-            "price_change_24h": float(change_24h) if change_24h is not None else 0.0,
-            "logo_url": token.get("logo_url") or "",
-            "dex_url": "",
-            "pools": pools,
-        }
 async def get_current_price(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[float]:
     data = await get_token_data(token_address, chain)
     if data and data["price_usd"] > 0:
