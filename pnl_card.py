@@ -42,7 +42,7 @@ DIVIDER_COLOR = (60, 90, 140, 140)
 CONTENT_LEFT = 70
 CONTENT_RIGHT = 940
 LOGO_SIZE = 92
-COL_GAP = 460  # x-offset of the second stat column relative to CONTENT_LEFT
+COL_GAP = 480  # x-offset of the second stat column relative to CONTENT_LEFT
 
 
 def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -221,7 +221,7 @@ def _draw_accent_line(draw: ImageDraw.ImageDraw, x: int, y: int, width: int = 32
 def _stat(draw, x, y, label, value, value_color=WHITE, label_font=None, value_font=None):
     draw.text((x, y), label, font=label_font, fill=LABEL_GRAY)
     _draw_accent_line(draw, x, y + label_font.size + 4)
-    draw.text((x, y + 40), value, font=value_font, fill=value_color)
+    draw.text((x, y + 46), value, font=value_font, fill=value_color)
 
 
 def generate_pnl_card(trade: dict) -> str:
@@ -239,9 +239,9 @@ def generate_pnl_card(trade: dict) -> str:
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    symbol_font = _font(FONT_REGULAR, 34)
-    label_font = _font(FONT_REGULAR, 26)
-    value_font = _font(FONT_BOLD, 46)
+    symbol_font = _font(FONT_REGULAR, 38)
+    label_font = _font(FONT_REGULAR, 30)
+    value_font = _font(FONT_BOLD, 54)
 
     pnl = float(trade["pnl"])
     pnl_pct = float(trade["pnl_pct"])
@@ -264,10 +264,10 @@ def generate_pnl_card(trade: dict) -> str:
 
     text_x = x + LOGO_SIZE + 24
     max_name_width = CONTENT_RIGHT - text_x
-    fitted_name_font = _fit_text(draw, trade["token_name"], FONT_BOLD, max_name_width, 58, min_size=30)
+    fitted_name_font = _fit_text(draw, trade["token_name"], FONT_BOLD, max_name_width, 66, min_size=34)
     name_display = _truncate_to_width(draw, trade["token_name"], fitted_name_font, max_name_width)
     draw.text((text_x, y + 6), name_display, font=fitted_name_font, fill=WHITE)
-    draw.text((text_x, y + 62), trade["token_symbol"].upper(), font=symbol_font, fill=LABEL_GRAY)
+    draw.text((text_x, y + 68), trade["token_symbol"].upper(), font=symbol_font, fill=LABEL_GRAY)
 
     # --- Divider ------------------------------------------------------------
     y += LOGO_SIZE + 34
@@ -275,7 +275,7 @@ def generate_pnl_card(trade: dict) -> str:
 
     # --- Stat grid (2 columns x 4 rows) -------------------------------------
     y += 40
-    row_h = 106
+    row_h = 118
     col2_x = x + COL_GAP
 
     _stat(draw, x, y, "ENTRY MCAP", _fmt_compact(trade["entry_market_cap"]),
@@ -303,7 +303,7 @@ def generate_pnl_card(trade: dict) -> str:
     username = trade.get("username")
     if username:
         handle = username if str(username).startswith("@") else f"@{username}"
-        uname_font = _font(FONT_BOLD, 38)
+        uname_font = _font(FONT_BOLD, 44)
         text_w = draw.textlength(handle, font=uname_font)
         margin = 50
         ux = base.width - margin - text_w
