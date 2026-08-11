@@ -33,9 +33,9 @@ RED = (248, 113, 113, 255)
 CYAN = (56, 189, 248, 255)
 DIVIDER_COLOR = (60, 90, 140, 140)
 
-# Layout is tuned for the current 1753x897 template. The right ~45% of the
-# image is the boat/wave illustration, so all text stays in the left/upper
-# dark region.
+# Layout is tuned for the current 1751x898 template, which already carries
+# the PAPERBOAT logo/wordmark (top-right) and wave/candlestick art (right
+# and bottom), so all overlaid text stays in the left/upper dark region.
 CONTENT_LEFT = 70
 CONTENT_RIGHT = 940
 LOGO_SIZE = 92
@@ -209,7 +209,7 @@ def _draw_logo_placeholder(draw: ImageDraw.ImageDraw, box, symbol: str) -> None:
 
 def _stat(draw, x, y, label, value, value_color=WHITE, label_font=None, value_font=None):
     draw.text((x, y), label, font=label_font, fill=LABEL_GRAY)
-    draw.text((x, y + 30), value, font=value_font, fill=value_color)
+    draw.text((x, y + 34), value, font=value_font, fill=value_color)
 
 
 def generate_pnl_card(trade: dict) -> str:
@@ -227,10 +227,9 @@ def generate_pnl_card(trade: dict) -> str:
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    header_font = _font(FONT_BOLD, 40)
-    symbol_font = _font(FONT_REGULAR, 30)
-    label_font = _font(FONT_REGULAR, 22)
-    value_font = _font(FONT_BOLD, 40)
+    symbol_font = _font(FONT_REGULAR, 34)
+    label_font = _font(FONT_REGULAR, 26)
+    value_font = _font(FONT_BOLD, 46)
 
     pnl = float(trade["pnl"])
     pnl_pct = float(trade["pnl_pct"])
@@ -238,16 +237,11 @@ def generate_pnl_card(trade: dict) -> str:
     accent = GREEN if is_win else RED
     sign = "+" if pnl >= 0 else ""
 
-    # --- Header -----------------------------------------------------------
-    x = CONTENT_LEFT
-    y = 55
-    draw_text_with_emoji(overlay, (x, y), "🚤 PAPERBOAT", _font(FONT_BOLD, 30), CYAN, emoji_px=32)
-    y += 44
-    status_label = trade.get("status_label") or "TRADE CLOSED"
-    draw.text((x, y), status_label, font=header_font, fill=WHITE)
-
     # --- Token identity (logo + name/symbol) -------------------------------
-    y += 70
+    # No header text here anymore - the template background already carries
+    # the PAPERBOAT logo/wordmark in its top-right corner.
+    x = CONTENT_LEFT
+    y = 100
     logo_box = (x, y, x + LOGO_SIZE, y + LOGO_SIZE)
     logo_img = _fetch_logo(trade.get("logo_url"), LOGO_SIZE)
     if logo_img is not None:
@@ -258,7 +252,7 @@ def generate_pnl_card(trade: dict) -> str:
 
     text_x = x + LOGO_SIZE + 24
     max_name_width = CONTENT_RIGHT - text_x
-    fitted_name_font = _fit_text(draw, trade["token_name"], FONT_BOLD, max_name_width, 52, min_size=28)
+    fitted_name_font = _fit_text(draw, trade["token_name"], FONT_BOLD, max_name_width, 58, min_size=30)
     name_display = _truncate_to_width(draw, trade["token_name"], fitted_name_font, max_name_width)
     draw.text((text_x, y + 6), name_display, font=fitted_name_font, fill=WHITE)
     draw.text((text_x, y + 62), trade["token_symbol"].upper(), font=symbol_font, fill=LABEL_GRAY)
@@ -269,7 +263,7 @@ def generate_pnl_card(trade: dict) -> str:
 
     # --- Stat grid (2 columns x 4 rows) -------------------------------------
     y += 40
-    row_h = 100
+    row_h = 106
     col2_x = x + COL_GAP
 
     _stat(draw, x, y, "ENTRY MCAP", _fmt_compact(trade["entry_market_cap"]),
@@ -297,7 +291,7 @@ def generate_pnl_card(trade: dict) -> str:
     username = trade.get("username")
     if username:
         handle = username if str(username).startswith("@") else f"@{username}"
-        uname_font = _font(FONT_BOLD, 34)
+        uname_font = _font(FONT_BOLD, 38)
         text_w = draw.textlength(handle, font=uname_font)
         margin = 50
         ux = base.width - margin - text_w
