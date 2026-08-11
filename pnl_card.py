@@ -221,7 +221,7 @@ def _draw_accent_line(draw: ImageDraw.ImageDraw, x: int, y: int, width: int = 32
 def _stat(draw, x, y, label, value, value_color=WHITE, label_font=None, value_font=None):
     draw.text((x, y), label, font=label_font, fill=LABEL_GRAY)
     _draw_accent_line(draw, x, y + label_font.size + 4)
-    draw.text((x, y + 46), value, font=value_font, fill=value_color)
+    draw.text((x, y + 48), value, font=value_font, fill=value_color)
 
 
 def generate_pnl_card(trade: dict) -> str:
@@ -239,9 +239,9 @@ def generate_pnl_card(trade: dict) -> str:
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    symbol_font = _font(FONT_REGULAR, 38)
-    label_font = _font(FONT_REGULAR, 30)
-    value_font = _font(FONT_BOLD, 54)
+    symbol_font = _font(FONT_REGULAR, 35)
+    label_font = _font(FONT_REGULAR, 32)
+    value_font = _font(FONT_BOLD, 58)
 
     pnl = float(trade["pnl"])
     pnl_pct = float(trade["pnl_pct"])
@@ -264,7 +264,7 @@ def generate_pnl_card(trade: dict) -> str:
 
     text_x = x + LOGO_SIZE + 24
     max_name_width = CONTENT_RIGHT - text_x
-    fitted_name_font = _fit_text(draw, trade["token_name"], FONT_BOLD, max_name_width, 66, min_size=34)
+    fitted_name_font = _fit_text(draw, trade["token_name"], FONT_BOLD, max_name_width, 68, min_size=36)
     name_display = _truncate_to_width(draw, trade["token_name"], fitted_name_font, max_name_width)
     draw.text((text_x, y + 22), name_display, font=fitted_name_font, fill=WHITE)
     draw.text((text_x, y + 84), trade["token_symbol"].upper(), font=symbol_font, fill=LABEL_GRAY)
@@ -275,7 +275,7 @@ def generate_pnl_card(trade: dict) -> str:
 
     # --- Stat grid (2 columns x 4 rows) -------------------------------------
     y += 40
-    row_h = 118
+    row_h = 130
     col2_x = x + COL_GAP
 
     _stat(draw, x, y, "ENTRY MCAP", _fmt_compact(trade["entry_market_cap"]),
