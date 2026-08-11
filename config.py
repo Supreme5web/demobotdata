@@ -9,6 +9,7 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CODEX_API_KEY = os.getenv("CODEX_API_KEY")
 
 # App constants
 # Starting demo balance for a new user, and the currency it (and every buy)
@@ -25,18 +26,25 @@ USDC_BUY_PRESETS = [50, 100, 250, 500]
 # ---------------------------------------------------------------------------
 # Chains
 # ---------------------------------------------------------------------------
-# Market data comes from DexScreener's free, public API
-# (https://api.dexscreener.com, docs: https://docs.dexscreener.com/api/reference)
-# - no API key required. DexScreener identifies tokens by (chain slug, address),
-# so each chain below carries its own "dexscreener_chain_id" used to build the
-# `/tokens/v1/{dexscreener_chain_id}/{address}` request URL.
+# Market data comes from Codex.io's GraphQL API (https://graph.codex.io/graphql,
+# docs: https://docs.codex.io) - requires an API key (CODEX_API_KEY above),
+# sent as the raw value of the `Authorization` header (no "Bearer " prefix).
+# Codex identifies tokens by (networkId, address) rather than a chain slug,
+# so each chain below carries its own "codex_network_id" used as the
+# `networkId` GraphQL variable.
+#
+# NOTE on "robinhood": Codex's network coverage is generated live from their
+# API and Robinhood Chain is very new (mainnet chain ID 4663), so it may not
+# be indexed yet. If lookups for this chain come back empty, that's likely
+# why - worth confirming against `getNetworks` in the Codex API directly,
+# or falling back to another data source for this chain specifically.
 #
 # "address_kind" is used by main.py to auto-detect which chain a pasted
 # contract address belongs to: Solana addresses are base58 while every EVM
 # chain (BSC, Robinhood Chain, ...) shares the same 0x-hex format, so two
 # chains can share a kind. When that happens the address alone can't tell
-# them apart - main.py resolves it by querying DexScreener for the address
-# on each candidate chain and using whichever one actually has the token
+# them apart - main.py resolves it by querying Codex for the address on
+# each candidate chain and using whichever one actually has the token
 # listed.
 #
 # trading.py, database.py, and main.py all thread a `chain` argument through
@@ -48,7 +56,7 @@ CHAINS = {
         "native_symbol": "SOL",
         "buy_presets": USDC_BUY_PRESETS,
         "explorer_url": "https://dexscreener.com/solana/{address}",
-        "dexscreener_chain_id": "solana",
+        "codex_network_id": 1399811149,
         "address_kind": "solana",
     },
     "bsc": {
@@ -56,7 +64,7 @@ CHAINS = {
         "native_symbol": "BNB",
         "buy_presets": USDC_BUY_PRESETS,
         "explorer_url": "https://dexscreener.com/bsc/{address}",
-        "dexscreener_chain_id": "bsc",
+        "codex_network_id": 56,
         "address_kind": "evm",
     },
     "robinhood": {
@@ -64,7 +72,7 @@ CHAINS = {
         "native_symbol": "ETH",
         "buy_presets": USDC_BUY_PRESETS,
         "explorer_url": "https://dexscreener.com/robinhood/{address}",
-        "dexscreener_chain_id": "robinhood",
+        "codex_network_id": 4663,
         "address_kind": "evm",
     },
 }
@@ -75,6 +83,7 @@ REQUIRED_VARS = {
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_KEY": SUPABASE_KEY,
     "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+    "CODEX_API_KEY": CODEX_API_KEY,
 }
 
 missing = [name for name, value in REQUIRED_VARS.items() if not value]
