@@ -23,10 +23,10 @@ TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "assets", "pnl_card_temp
 FONT_DIR = os.path.join(os.path.dirname(__file__), "assets", "fonts")
 EMOJI_FONT = os.path.join(FONT_DIR, "NotoColorEmoji.ttf")
 
-# Orbitron everywhere: Bold for headings/values/numbers, Medium for labels
+# Rajdhani everywhere: Bold for headings/values/numbers, Medium for labels
 # and secondary text (token symbol, username uses Bold to stay prominent).
-FONT_BOLD = os.path.join(FONT_DIR, "Orbitron-Bold.ttf")
-FONT_REGULAR = os.path.join(FONT_DIR, "Orbitron-Medium.ttf")
+FONT_BOLD = os.path.join(FONT_DIR, "Rajdhani-Bold.ttf")
+FONT_REGULAR = os.path.join(FONT_DIR, "Rajdhani-Medium.ttf")
 
 # Colors
 WHITE = (255, 255, 255, 255)
