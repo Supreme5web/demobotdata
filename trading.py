@@ -13,6 +13,46 @@ class TradingError(Exception):
     """Raised for user-facing trading failures (insufficient balance, bad price, etc.)."""
 
 
+def _resolve_default_tp_sl(user: dict, entry_price: float, entry_market_cap: float):
+    """Converts a user's /settings default TP/SL into actual tp_price/
+    sl_price thresholds for a brand-new position - the same thresholds
+    the TP/SL monitor in main.py's check_tp_sl_triggers() compares live
+    price against.
+
+    Two storage modes, chosen via user["tp_sl_mode"] ("multiple", the
+    default, or "mcap"):
+      - "multiple": default_tp_multiple (e.g. 3 for 3x) and
+        default_sl_percent (e.g. 20 for -20%), both relative to entry
+        price - the original behavior.
+      - "mcap": default_tp_market_cap / default_sl_market_cap are an
+        absolute target market cap in USD. Since positions are only ever
+        monitored by price (not market cap), the target is converted to a
+        price via its ratio to entry_market_cap: a target of 2x the entry
+        mcap implies the same 2x move in price.
+
+    Returns (tp_price, sl_price), either or both of which may be None if
+    unset - or if in "mcap" mode with no usable entry_market_cap to convert
+    against, in which case both are skipped rather than risk a
+    wildly-wrong price threshold from a zero/near-zero denominator.
+    """
+    mode = user.get("tp_sl_mode") or "multiple"
+
+    if mode == "mcap":
+        if entry_market_cap <= 0:
+            return None, None
+        default_tp_mcap = user.get("default_tp_market_cap")
+        default_sl_mcap = user.get("default_sl_market_cap")
+        tp_price = entry_price * (float(default_tp_mcap) / entry_market_cap) if default_tp_mcap else None
+        sl_price = entry_price * (float(default_sl_mcap) / entry_market_cap) if default_sl_mcap else None
+        return tp_price, sl_price
+
+    default_tp_mult = user.get("default_tp_multiple")
+    default_sl_pct = user.get("default_sl_percent")
+    tp_price = entry_price * float(default_tp_mult) if default_tp_mult else None
+    sl_price = entry_price * (1 - float(default_sl_pct) / 100) if default_sl_pct else None
+    return tp_price, sl_price
+
+
 async def execute_buy(user: dict, token_address: str, usdc_amount: float, chain: str = DEFAULT_CHAIN) -> dict:
     """Buy a token using an amount denominated in USDC, the bot's demo
     trading currency. USDC is pegged 1:1 to USD, so - unlike a chain's
@@ -87,11 +127,10 @@ async def execute_buy(user: dict, token_address: str, usdc_amount: float, chain:
     else:
         # Apply the user's /settings auto TP/SL defaults (if any) to a
         # brand-new position only - DCA buys above keep whatever TP/SL was
-        # already set on the existing position untouched.
-        default_tp_mult = user.get("default_tp_multiple")
-        default_sl_pct = user.get("default_sl_percent")
-        default_tp_price = entry_price * float(default_tp_mult) if default_tp_mult else None
-        default_sl_price = entry_price * (1 - float(default_sl_pct) / 100) if default_sl_pct else None
+        # already set on the existing position untouched. Handles both
+        # default modes (multiplier/percent or absolute market cap target)
+        # via _resolve_default_tp_sl().
+        default_tp_price, default_sl_price = _resolve_default_tp_sl(user, entry_price, entry_market_cap)
 
         await db.create_position(
             {

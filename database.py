@@ -67,8 +67,13 @@ async def update_balance(user_id: str, new_balance: float) -> None:
 
 
 async def update_user_settings(user_id: str, fields: dict) -> None:
-    """Persists /settings changes: buy_presets (list) and/or
-    default_tp_multiple / default_sl_percent (numeric or None to clear)."""
+    """Persists /settings changes: buy_presets (list); tp_sl_mode
+    ("multiple" or "mcap"); default_tp_multiple / default_sl_percent
+    (numeric or None to clear, used in "multiple" mode); and
+    default_tp_market_cap / default_sl_market_cap (numeric or None to
+    clear, used in "mcap" mode). All of these must already exist as
+    columns on the users table - this just does a generic partial update
+    with whatever's in `fields`, it doesn't validate column names."""
     def _op():
         supabase.table("users").update(fields).eq("id", user_id).execute()
 

@@ -499,23 +499,37 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def build_settings_text(user: dict) -> str:
     presets = user.get("buy_presets") or config.USDC_BUY_PRESETS
     presets_str = ", ".join(f"${p:g}" for p in presets)
-    tp = user.get("default_tp_multiple")
-    sl = user.get("default_sl_percent")
-    tp_str = f"{float(tp):g}x" if tp else "Off"
-    sl_str = f"-{float(sl):g}%" if sl else "Off"
+    mode = user.get("tp_sl_mode") or "multiple"
+    mode_label = "Market Cap" if mode == "mcap" else "Multiplier"
+
+    if mode == "mcap":
+        tp = user.get("default_tp_market_cap")
+        sl = user.get("default_sl_market_cap")
+        tp_str = fmt_compact(tp) if tp else "Off"
+        sl_str = fmt_compact(sl) if sl else "Off"
+    else:
+        tp = user.get("default_tp_multiple")
+        sl = user.get("default_sl_percent")
+        tp_str = f"{float(tp):g}x" if tp else "Off"
+        sl_str = f"-{float(sl):g}%" if sl else "Off"
+
     return (
         "⚙️ <b>SETTINGS</b>\n\n"
         f"🟢 Buy Buttons: <b>{presets_str}</b>\n"
+        f"🔁 TP/SL Mode: <b>{mode_label}</b>\n"
         f"🎯 Default TP: <b>{tp_str}</b>\n"
         f"🛑 Default SL: <b>{sl_str}</b>\n\n"
         "Default TP/SL auto-apply the moment you open a brand-new position."
     )
 
 
-def build_settings_keyboard() -> InlineKeyboardMarkup:
+def build_settings_keyboard(user: Optional[dict] = None) -> InlineKeyboardMarkup:
+    mode = (user or {}).get("tp_sl_mode") or "multiple"
+    mode_label = "🏦 Market Cap" if mode == "mcap" else "✖️ Multiplier"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✏️ Edit Buy Buttons", callback_data="stgbuy")],
+            [InlineKeyboardButton(f"🔁 TP/SL Mode: {mode_label}", callback_data="stgmode")],
             [
                 InlineKeyboardButton("🎯 Set Default TP", callback_data="stgtp"),
                 InlineKeyboardButton("❌ Clear TP", callback_data="stgtpclear"),
@@ -531,7 +545,7 @@ def build_settings_keyboard() -> InlineKeyboardMarkup:
 async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = await get_user(update)
     await update.message.reply_text(
-        build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+        build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard(user)
     )
 
 
@@ -542,6 +556,27 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"{balance_line}",
         parse_mode=ParseMode.HTML,
     )
+
+
+def build_positions_overview_keyboard(positions: list) -> InlineKeyboardMarkup:
+    """One tappable button per open position (symbol + live PNL%), each
+    opening that position's full trade page on tap. Replaces the old
+    behavior of sending a full position card for every open position
+    straight into the chat, which buried the group in messages as soon as
+    someone held more than one or two coins."""
+    rows = []
+    for pos in positions:
+        chain = pos.get("chain") or DEFAULT_CHAIN
+        amount = float(pos["amount"])
+        invested = float(pos["invested_amount"])
+        entry_price = float(pos["entry_price"])
+        current_price = float(pos.get("current_price") or entry_price)
+        pnl = (amount * current_price) - invested
+        pnl_pct = (pnl / invested * 100) if invested else 0.0
+        label = f"{pnl_symbol(pnl)} {pos['token_symbol']} {pnl_pct:+.1f}%"
+        cc = callback_chain_code(chain)
+        rows.append([InlineKeyboardButton(label, callback_data=f"vp:{cc}:{pos['token_address']}")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -565,50 +600,35 @@ async def positions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         total_value += amount * current_price
 
     total_pnl = total_value - total_invested
-    total_pnl_pct = (total_pnl / total_invested * 100) if total_invested else 0.0
 
     overview = (
         "📊 <b>POSITIONS OVERVIEW</b>\n\n"
-        f"Open Positions: <b>{len(positions)}</b>\n"
-        f"Total Invested: {fmt_usd(total_invested)}\n"
-        f"Current Value: {fmt_usd(total_value)}\n\n"
-        f"Total PNL: <b>{pnl_symbol(total_pnl)} {fmt_usd(total_pnl)} ({total_pnl_pct:+.2f}%)</b>"
+        f"Open Positions: <b>{len(positions)}</b>\n\n"
+        f"Unrealized: <b>{pnl_symbol(total_pnl)} {fmt_usd(total_pnl)}</b>"
     )
-    await update.message.reply_text(overview, parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        overview,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_positions_overview_keyboard(positions),
+    )
 
-    for pos in positions:
-        chain = pos.get("chain") or DEFAULT_CHAIN
-        amount = float(pos["amount"])
-        invested = float(pos["invested_amount"])
-        entry_price = float(pos["entry_price"])
-        entry_mcap = float(pos.get("entry_market_cap") or 0)
-        current_mcap = float(pos.get("current_market_cap") or entry_mcap)
-        current_price = float(pos.get("current_price") or entry_price)
-        current_value = amount * current_price
-        pnl = current_value - invested
-        pnl_pct = (pnl / invested * 100) if invested else 0.0
 
-        text = format_position_card(
-            name=pos["token_name"],
-            symbol=pos["token_symbol"],
-            token_address=pos["token_address"],
-            chain=chain,
-            entry_price=entry_price,
-            entry_market_cap=entry_mcap,
-            current_market_cap=current_mcap,
-            tokens=amount,
-            invested=invested,
-            pnl=pnl,
-            pnl_pct=pnl_pct,
-            tp_price=pos.get("tp_price"),
-            sl_price=pos.get("sl_price"),
-        )
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=build_position_keyboard(pos["token_address"], chain, get_buy_presets(user, chain)),
-            disable_web_page_preview=True,
-        )
+async def process_view_position(query, chain: str, token_address: str) -> None:
+    """Opens the full trade page (Buy/Sell/TP/SL buttons, live PNL) for a
+    position tapped from the /positions overview buttons. Sent as a fresh
+    message rather than an edit, so the overview message and its button
+    list stay put and reusable for opening other positions."""
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+    rendered = await render_position_card(user["id"], token_address, chain, live=True)
+    if not rendered:
+        await query.answer("This position has been closed.", show_alert=True)
+        return
+    text, keyboard = rendered
+    await query.message.reply_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=keyboard, disable_web_page_preview=True
+    )
+    await query.answer()
 
 
 async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1089,41 +1109,53 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await db.update_user_settings(user["id"], {"buy_presets": presets})
         user["buy_presets"] = presets
         await update.message.reply_text(
-            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard(user)
         )
         return
 
     if context.user_data.get("awaiting_settings_tp"):
         context.user_data.pop("awaiting_settings_tp", None)
+        user = await get_user(update)
+        mode = user.get("tp_sl_mode") or "multiple"
         try:
-            multiple = float(text)
-            if multiple <= 0:
+            value = float(text.replace(",", "").replace("$", "").strip())
+            if value <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("Please send a valid multiple, e.g. 3 for 3x")
+            hint = "e.g. 5000000 for $5M" if mode == "mcap" else "e.g. 3 for 3x"
+            await update.message.reply_text(f"Please send a valid number, {hint}")
             return
-        user = await get_user(update)
-        await db.update_user_settings(user["id"], {"default_tp_multiple": multiple})
-        user["default_tp_multiple"] = multiple
+        if mode == "mcap":
+            await db.update_user_settings(user["id"], {"default_tp_market_cap": value})
+            user["default_tp_market_cap"] = value
+        else:
+            await db.update_user_settings(user["id"], {"default_tp_multiple": value})
+            user["default_tp_multiple"] = value
         await update.message.reply_text(
-            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard(user)
         )
         return
 
     if context.user_data.get("awaiting_settings_sl"):
         context.user_data.pop("awaiting_settings_sl", None)
+        user = await get_user(update)
+        mode = user.get("tp_sl_mode") or "multiple"
         try:
-            percent = float(text)
-            if percent <= 0:
+            value = float(text.replace(",", "").replace("$", "").strip())
+            if value <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("Please send a valid percent, e.g. 20 for -20%")
+            hint = "e.g. 500000 for $500K" if mode == "mcap" else "e.g. 20 for -20%"
+            await update.message.reply_text(f"Please send a valid number, {hint}")
             return
-        user = await get_user(update)
-        await db.update_user_settings(user["id"], {"default_sl_percent": percent})
-        user["default_sl_percent"] = percent
+        if mode == "mcap":
+            await db.update_user_settings(user["id"], {"default_sl_market_cap": value})
+            user["default_sl_market_cap"] = value
+        else:
+            await db.update_user_settings(user["id"], {"default_sl_percent": value})
+            user["default_sl_percent"] = value
         await update.message.reply_text(
-            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard(user)
         )
         return
 
@@ -1203,32 +1235,53 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.message.reply_text("Send your SL as a percent below entry market cap, e.g. 25 for -25%")
     elif action == "bp" and len(parts) == 3:
         await process_back_to_position(query, callback_chain(parts[1]), parts[2])
+    elif action == "vp" and len(parts) == 3:
+        await process_view_position(query, callback_chain(parts[1]), parts[2])
     elif action == "stgbuy":
         await query.answer()
         context.user_data["awaiting_settings_buy"] = True
         await query.message.reply_text("Send 4 comma-separated USDC amounts, e.g. 50,100,250,500")
+    elif action == "stgmode":
+        user = await get_or_create_from_query(query)
+        new_mode = "mcap" if (user.get("tp_sl_mode") or "multiple") == "multiple" else "multiple"
+        await db.update_user_settings(user["id"], {"tp_sl_mode": new_mode})
+        user["tp_sl_mode"] = new_mode
+        await query.edit_message_text(
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard(user)
+        )
+        await query.answer(f"TP/SL mode set to {'Market Cap' if new_mode == 'mcap' else 'Multiplier'}")
     elif action == "stgtp":
         await query.answer()
+        user = await get_or_create_from_query(query)
         context.user_data["awaiting_settings_tp"] = True
-        await query.message.reply_text("Send your default TP as a multiple of entry market cap, e.g. 3 for 3x")
+        if (user.get("tp_sl_mode") or "multiple") == "mcap":
+            await query.message.reply_text("Send your default TP as a target market cap, e.g. 5000000 for $5M")
+        else:
+            await query.message.reply_text("Send your default TP as a multiple of entry market cap, e.g. 3 for 3x")
     elif action == "stgsl":
         await query.answer()
+        user = await get_or_create_from_query(query)
         context.user_data["awaiting_settings_sl"] = True
-        await query.message.reply_text("Send your default SL as a percent below entry market cap, e.g. 20 for -20%")
+        if (user.get("tp_sl_mode") or "multiple") == "mcap":
+            await query.message.reply_text("Send your default SL as a target market cap, e.g. 500000 for $500K")
+        else:
+            await query.message.reply_text("Send your default SL as a percent below entry market cap, e.g. 20 for -20%")
     elif action == "stgtpclear":
         user = await get_or_create_from_query(query)
-        await db.update_user_settings(user["id"], {"default_tp_multiple": None})
+        await db.update_user_settings(user["id"], {"default_tp_multiple": None, "default_tp_market_cap": None})
         user["default_tp_multiple"] = None
+        user["default_tp_market_cap"] = None
         await query.edit_message_text(
-            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard(user)
         )
         await query.answer("Default TP cleared")
     elif action == "stgslclear":
         user = await get_or_create_from_query(query)
-        await db.update_user_settings(user["id"], {"default_sl_percent": None})
+        await db.update_user_settings(user["id"], {"default_sl_percent": None, "default_sl_market_cap": None})
         user["default_sl_percent"] = None
+        user["default_sl_market_cap"] = None
         await query.edit_message_text(
-            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard()
+            build_settings_text(user), parse_mode=ParseMode.HTML, reply_markup=build_settings_keyboard(user)
         )
         await query.answer("Default SL cleared")
     else:
@@ -1271,6 +1324,18 @@ async def check_tp_sl_triggers() -> None:
         except Exception:
             logger.exception("Auto TP/SL sell failed for position %s", pos.get("id"))
             continue
+
+        trigger_label = "🎯 <b>TP has been triggered</b>" if hit_tp else "🛑 <b>SL has been triggered</b>"
+        trigger_text = (
+            f"{trigger_label}\n"
+            f"PNL: <b>{fmt_usd(result['pnl'])} ({result['pnl_pct']:+.2f}%)</b>"
+        )
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=user["telegram_id"], text=trigger_text, parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            logger.debug("Could not send TP/SL trigger notice", exc_info=True)
 
         await send_pnl_card(
             telegram_app.bot,
