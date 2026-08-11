@@ -28,6 +28,12 @@ from config import CHAINS, DEFAULT_CHAIN
 logger = logging.getLogger(__name__)
 
 DEXPAPRIKA_BASE_URL = "https://api.dexpaprika.com"
+DEXSCREENER_API_BASE_URL = "https://api.dexscreener.com"
+
+# Maps our internal chain code to DexScreener's chainId slug. Used both for
+# the /tokens/v1 API lookup below and for the guessed logo-CDN fallback -
+# DexScreener uses the same slugs for both.
+_DEXSCREENER_CHAIN_SLUGS = {"sol": "solana", "bsc": "bsc", "robinhood": "robinhood"}
 
 
 def _chain_cfg(chain: str) -> dict:
@@ -95,13 +101,70 @@ async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[d
     return None
 
 
+def _dexscreener_chain_slug(chain: str) -> str:
+    return _DEXSCREENER_CHAIN_SLUGS.get(chain, chain)
 
-def _logo_url(token_address: str, chain: str) -> str:
-    """Return a stable token-logo URL for chains supported by DexScreener's
-    public token-image CDN. DexPaprika provides has_image but not the image URL.
+
+async def _fetch_dexscreener_logo(token_address: str, chain: str) -> Optional[str]:
+    """Queries DexScreener's own GET /tokens/v1/{chainId}/{tokenAddress}
+    endpoint for a verified logo. Unlike DexPaprika (which only exposes a
+    has_image boolean, no URL) DexScreener's pair objects carry a real
+    info.imageUrl field. A token can have multiple pairs/pools, each
+    potentially with its own imageUrl, so we pick the imageUrl from
+    whichever pair has the most USD liquidity - that's the pair
+    DexScreener's own UI would surface first, and the one most likely to
+    have curated art attached.
+
+    Returns None (never raises) if the token has no pairs, no pair carries
+    an image, or the request fails - a miss here just means the caller
+    falls back to the guessed CDN URL, and pnl_card.py falls back further
+    to a letter badge, so nothing downstream breaks."""
+    chain_slug = _dexscreener_chain_slug(chain)
+    url = f"{DEXSCREENER_API_BASE_URL}/tokens/v1/{chain_slug}/{token_address}"
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            resp = await client.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            pairs = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("DexScreener /tokens/v1 lookup failed (%s/%s): %s", chain, token_address, exc)
+        return None
+
+    if not isinstance(pairs, list) or not pairs:
+        return None
+
+    candidates = [p for p in pairs if _dig(p, "info.imageUrl", default=None)]
+    if not candidates:
+        return None
+
+    best_pair = max(candidates, key=lambda p: float(_dig(p, "liquidity.usd", default=0) or 0))
+    return _dig(best_pair, "info.imageUrl", default=None)
+
+
+def _guessed_logo_url(token_address: str, chain: str) -> str:
+    """Last-resort fallback: guesses a URL on DexScreener's public
+    token-image CDN by convention, without confirming it actually exists.
+    Used only when _fetch_dexscreener_logo() above can't find a verified
+    imageUrl (e.g. the token has no indexed pairs yet, or the API call
+    failed) - pnl_card.py's _fetch_logo() will 404/fail gracefully into a
+    letter badge if this guess turns out to be wrong.
     """
-    chain_slug = {"sol": "solana", "bsc": "bsc", "robinhood": "robinhood"}.get(chain, chain)
+    chain_slug = _dexscreener_chain_slug(chain)
     return f"https://dd.dexscreener.com/ds-data/tokens/{chain_slug}/{token_address}.png"
+
+
+async def _resolve_logo_url(token_address: str, chain: str) -> str:
+    """Best-effort logo resolution, verified source first: try
+    DexScreener's /tokens/v1 API (real info.imageUrl) before falling back
+    to guessing the CDN path directly. Always returns *some* URL string -
+    downstream, pnl_card.py treats a bad/missing image as "no logo" and
+    draws a letter badge instead, so a wrong guess is never fatal."""
+    verified = await _fetch_dexscreener_logo(token_address, chain)
+    if verified:
+        return verified
+    return _guessed_logo_url(token_address, chain)
 
 
 async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[dict]:
@@ -170,9 +233,9 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
         "pair_address": "",
         "dex_url": "",
         # DexPaprika's token endpoint only returns a `has_image` boolean, not
-        # a usable image URL, so this stays empty - pnl_card.py already
-        # falls back to a letter badge when no logo is available.
-        "logo_url": _logo_url(token_address, chain),
+        # a usable image URL, so this comes from DexScreener instead - see
+        # _resolve_logo_url() for the verified-first, guessed-fallback logic.
+        "logo_url": await _resolve_logo_url(token_address, chain),
     }
 
 
