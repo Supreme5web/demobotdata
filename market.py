@@ -70,6 +70,31 @@ async def _query_dexpaprika(token_address: str, chain: str) -> Optional[dict]:
         return None
 
 
+async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[dict]:
+    """Fallback for tokens whose /tokens/{address} 'summary' object hasn't
+    been fully populated yet - DexPaprika's own site flags this explicitly
+    for very new chains (e.g. Robinhood Chain, live since July 2026):
+    "Summary is present but summary.price_usd is missing, non-finite, or
+    zero." The flat /search endpoint has been observed to carry real
+    price/liquidity numbers for the same token even when the summary
+    endpoint doesn't yet, so it's worth a second try before giving up.
+    Returns the matching flat token dict, or None if no match / failure."""
+    network = _chain_cfg(chain)["dexpaprika_network_id"]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{DEXPAPRIKA_BASE_URL}/search", params={"query": token_address})
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error("DexPaprika /search fallback failed (%s/%s): %s", chain, token_address, exc)
+        return None
+
+    for token in data.get("tokens", []):
+        if token.get("chain") == network and str(token.get("id", "")).lower() == token_address.lower():
+            return token
+    return None
+
+
 async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[dict]:
     """Fetch token info from DexPaprika for a given token address on the
     given chain (see CHAINS in config.py for supported chains). Returns
@@ -90,6 +115,27 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
     liquidity_usd = _dig(result, "summary.liquidity_usd", default=0)
     volume_24h = _dig(result, "summary.24h.volume_usd", default=0)
     price_change_1h = _dig(result, "summary.1h.last_price_usd_change", default=0)
+
+    if price_usd <= 0:
+        # Summary endpoint came back empty on price - try the /search
+        # fallback before giving up (see _query_dexpaprika_search docstring).
+        fallback = await _query_dexpaprika_search(token_address, chain)
+        if fallback:
+            try:
+                price_usd = float(fallback.get("price_usd") or 0)
+            except (TypeError, ValueError):
+                price_usd = 0.0
+            if not market_cap:
+                market_cap = fallback.get("fdv_usd") or fallback.get("fdv") or 0
+            if not liquidity_usd:
+                liquidity_usd = fallback.get("liquidity_usd") or 0
+            if not volume_24h:
+                volume_24h = fallback.get("volume_usd") or fallback.get("volume_usd_24h") or 0
+            if price_usd > 0:
+                logger.info(
+                    "DexPaprika summary lacked price for %s/%s - used /search fallback instead.",
+                    chain, token_address,
+                )
 
     return {
         "token_address": token_address,
