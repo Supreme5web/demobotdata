@@ -41,7 +41,7 @@ DIVIDER_COLOR = (60, 90, 140, 140)
 # and bottom), so all overlaid text stays in the left/upper dark region.
 CONTENT_LEFT = 70
 CONTENT_RIGHT = 940
-LOGO_SIZE = 92
+LOGO_SIZE = 130
 COL_GAP = 480  # x-offset of the second stat column relative to CONTENT_LEFT
 
 
@@ -266,8 +266,8 @@ def generate_pnl_card(trade: dict) -> str:
     max_name_width = CONTENT_RIGHT - text_x
     fitted_name_font = _fit_text(draw, trade["token_name"], FONT_BOLD, max_name_width, 66, min_size=34)
     name_display = _truncate_to_width(draw, trade["token_name"], fitted_name_font, max_name_width)
-    draw.text((text_x, y + 6), name_display, font=fitted_name_font, fill=WHITE)
-    draw.text((text_x, y + 68), trade["token_symbol"].upper(), font=symbol_font, fill=LABEL_GRAY)
+    draw.text((text_x, y + 22), name_display, font=fitted_name_font, fill=WHITE)
+    draw.text((text_x, y + 84), trade["token_symbol"].upper(), font=symbol_font, fill=LABEL_GRAY)
 
     # --- Divider ------------------------------------------------------------
     y += LOGO_SIZE + 34
