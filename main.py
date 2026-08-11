@@ -92,6 +92,24 @@ def get_buy_presets(user: Optional[dict], chain: str) -> list:
     return CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
 
 
+# Compact chain codes keep Telegram callback_data safely under its 64-byte limit.
+# Full chain names + EVM/Solana addresses can otherwise exceed the limit.
+CALLBACK_CHAIN_CODES = {
+    "solana": "s",
+    "bsc": "b",
+    "robinhood": "r",
+}
+CALLBACK_CODE_TO_CHAIN = {code: chain for chain, code in CALLBACK_CHAIN_CODES.items()}
+
+
+def callback_chain_code(chain: str) -> str:
+    return CALLBACK_CHAIN_CODES[chain]
+
+
+def callback_chain(code: str) -> str:
+    return CALLBACK_CODE_TO_CHAIN[code]
+
+
 def pnl_share_link(token_address: str, chain: str) -> str:
     """Deep link that re-opens the bot and triggers a live PNL card for this
     position, via start_handler's payload parsing. Empty until BOT_USERNAME
@@ -277,16 +295,19 @@ def _pnl_share_line(token_address: str, chain: str) -> str:
 
 
 def build_position_keyboard(token_address: str, chain: str, buy_presets: Optional[list] = None) -> InlineKeyboardMarkup:
-    """Buy (DCA) buttons sit above the sell buttons - buying more of a
-    position the user already holds is at least as common an action as
-    selling it, and putting it first keeps DCA one tap away instead of
-    burying it back on the token-info card. `buy_presets` lets a caller pass
-    the user's /settings-customized amounts; falls back to the chain default."""
+    """Build the position keyboard using compact callback data.
+
+    Telegram limits InlineKeyboardButton callback_data to 64 bytes. Full
+    chain names plus token addresses can exceed that limit, especially on
+    Robinhood Chain. We therefore use one-letter chain codes and short action
+    codes while keeping the existing handler behavior unchanged.
+    """
     presets = buy_presets or CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
+    cc = callback_chain_code(chain)
     buy_rows = [
         [
             InlineKeyboardButton(
-                f"🟢 Buy ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}"
+                f"🟢 Buy ${amt:g}", callback_data=f"b:{cc}:{token_address}:{amt}"
             )
             for amt in presets[i : i + 2]
         ]
@@ -294,16 +315,16 @@ def build_position_keyboard(token_address: str, chain: str, buy_presets: Optiona
     ]
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{chain}:{token_address}")],
+            [InlineKeyboardButton("🔄 Refresh", callback_data=f"r:{cc}:{token_address}")],
             *buy_rows,
-            [InlineKeyboardButton("✏️ Custom Buy", callback_data=f"buycustom:{chain}:{token_address}")],
+            [InlineKeyboardButton("✏️ Custom Buy", callback_data=f"bc:{cc}:{token_address}")],
             [
-                InlineKeyboardButton("🎯 Set TP", callback_data=f"tpmenu:{chain}:{token_address}"),
-                InlineKeyboardButton("🛑 Set SL", callback_data=f"slmenu:{chain}:{token_address}"),
+                InlineKeyboardButton("🎯 Set TP", callback_data=f"tp:{cc}:{token_address}"),
+                InlineKeyboardButton("🛑 Set SL", callback_data=f"sl:{cc}:{token_address}"),
             ],
             [
-                InlineKeyboardButton("🔴 Sell 50%", callback_data=f"sell:{chain}:{token_address}:50"),
-                InlineKeyboardButton("🔴 Sell 100%", callback_data=f"sell:{chain}:{token_address}:100"),
+                InlineKeyboardButton("🔴 Sell 50%", callback_data=f"s:{cc}:{token_address}:50"),
+                InlineKeyboardButton("🔴 Sell 100%", callback_data=f"s:{cc}:{token_address}:100"),
             ],
             [InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address, chain))],
         ]
@@ -311,32 +332,34 @@ def build_position_keyboard(token_address: str, chain: str, buy_presets: Optiona
 
 
 def build_tp_menu_keyboard(token_address: str, chain: str) -> InlineKeyboardMarkup:
+    cc = callback_chain_code(chain)
     rows = []
     for i in range(0, len(TP_PRESETS), 2):
         rows.append(
             [
-                InlineKeyboardButton(f"🎯 {m}x", callback_data=f"tpset:{chain}:{token_address}:{m}")
+                InlineKeyboardButton(f"🎯 {m}x", callback_data=f"ts:{cc}:{token_address}:{m}")
                 for m in TP_PRESETS[i : i + 2]
             ]
         )
-    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"tpcustom:{chain}:{token_address}")])
-    rows.append([InlineKeyboardButton("❌ Clear TP", callback_data=f"tpset:{chain}:{token_address}:0")])
-    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{chain}:{token_address}")])
+    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"tc:{cc}:{token_address}")])
+    rows.append([InlineKeyboardButton("❌ Clear TP", callback_data=f"ts:{cc}:{token_address}:0")])
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"bp:{cc}:{token_address}")])
     return InlineKeyboardMarkup(rows)
 
 
 def build_sl_menu_keyboard(token_address: str, chain: str) -> InlineKeyboardMarkup:
+    cc = callback_chain_code(chain)
     rows = []
     for i in range(0, len(SL_PRESETS), 2):
         rows.append(
             [
-                InlineKeyboardButton(f"🛑 -{p}%", callback_data=f"slset:{chain}:{token_address}:{p}")
+                InlineKeyboardButton(f"🛑 -{p}%", callback_data=f"ss:{cc}:{token_address}:{p}")
                 for p in SL_PRESETS[i : i + 2]
             ]
         )
-    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"slcustom:{chain}:{token_address}")])
-    rows.append([InlineKeyboardButton("❌ Clear SL", callback_data=f"slset:{chain}:{token_address}:0")])
-    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"backpos:{chain}:{token_address}")])
+    rows.append([InlineKeyboardButton("✏️ Custom", callback_data=f"sc:{cc}:{token_address}")])
+    rows.append([InlineKeyboardButton("❌ Clear SL", callback_data=f"ss:{cc}:{token_address}:0")])
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data=f"bp:{cc}:{token_address}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -636,20 +659,26 @@ def build_token_info_text(token_data: dict, token_address: str, chain: str) -> s
 def build_token_info_keyboard(
     token_address: str, chain: str, dex_url: str = "", buy_presets: Optional[list] = None
 ) -> InlineKeyboardMarkup:
+    """Build token-info buttons with compact callback data.
+
+    In particular, this prevents Robinhood EVM addresses from pushing
+    callback_data over Telegram's 64-byte limit.
+    """
     presets = buy_presets or CHAINS.get(chain, CHAINS[DEFAULT_CHAIN])["buy_presets"]
+    cc = callback_chain_code(chain)
     keyboard = [
         [
-            InlineKeyboardButton(f"🟢 BUY ${amt:g}", callback_data=f"buy:{chain}:{token_address}:{amt}")
+            InlineKeyboardButton(f"🟢 BUY ${amt:g}", callback_data=f"b:{cc}:{token_address}:{amt}")
             for amt in presets[i : i + 2]
         ]
         for i in range(0, len(presets), 2)
     ]
     keyboard.append(
-        [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"buycustom:{chain}:{token_address}")]
+        [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"bc:{cc}:{token_address}")]
     )
     keyboard.append(
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data=f"refreshtoken:{chain}:{token_address}"),
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"rt:{cc}:{token_address}"),
             InlineKeyboardButton("📊 Chart", url=token_chart_url(token_address, chain, dex_url)),
         ]
     )
@@ -1129,51 +1158,51 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Each branch answers the callback query exactly once - Telegram rejects
     # a second answer() call on the same query, so several branches handle
     # their own (with a toast/alert) instead of us answering here up front.
-    if action == "buy" and len(parts) == 4:
+    if action == "b" and len(parts) == 4:
         await query.answer()
-        chain, token_address, amount_str = parts[1], parts[2], parts[3]
+        chain, token_address, amount_str = callback_chain(parts[1]), parts[2], parts[3]
         await process_buy(
             update, query.message, token_address, float(amount_str), chain,
             delete_chat_id=query.message.chat_id,
             delete_message_id=query.message.message_id,
         )
-    elif action == "buycustom" and len(parts) == 3:
+    elif action == "bc" and len(parts) == 3:
         await query.answer()
-        chain, token_address = parts[1], parts[2]
+        chain, token_address = callback_chain(parts[1]), parts[2]
         context.user_data["awaiting_custom_buy"] = {"chain": chain, "token_address": token_address}
         context.user_data["awaiting_custom_buy_origin"] = {
             "chat_id": query.message.chat_id,
             "message_id": query.message.message_id,
         }
         await query.message.reply_text("Send the amount of USDC you'd like to spend, e.g. 100")
-    elif action == "sell" and len(parts) == 4:
+    elif action == "s" and len(parts) == 4:
         await query.answer()
-        chain, token_address, percent_str = parts[1], parts[2], parts[3]
+        chain, token_address, percent_str = callback_chain(parts[1]), parts[2], parts[3]
         await process_sell(
             update, query.message, token_address, float(percent_str), chain, loading_query=query
         )
-    elif action == "refresh" and len(parts) == 3:
-        await process_refresh(query, parts[1], parts[2])
-    elif action == "refreshtoken" and len(parts) == 3:
-        await process_refresh_token(query, parts[1], parts[2])
-    elif action == "tpmenu" and len(parts) == 3:
-        await process_tp_menu(query, parts[1], parts[2])
-    elif action == "slmenu" and len(parts) == 3:
-        await process_sl_menu(query, parts[1], parts[2])
-    elif action == "tpset" and len(parts) == 4:
-        await process_tp_set(query, parts[1], parts[2], float(parts[3]))
-    elif action == "slset" and len(parts) == 4:
-        await process_sl_set(query, parts[1], parts[2], float(parts[3]))
-    elif action == "tpcustom" and len(parts) == 3:
+    elif action == "r" and len(parts) == 3:
+        await process_refresh(query, callback_chain(parts[1]), parts[2])
+    elif action == "rt" and len(parts) == 3:
+        await process_refresh_token(query, callback_chain(parts[1]), parts[2])
+    elif action == "tp" and len(parts) == 3:
+        await process_tp_menu(query, callback_chain(parts[1]), parts[2])
+    elif action == "sl" and len(parts) == 3:
+        await process_sl_menu(query, callback_chain(parts[1]), parts[2])
+    elif action == "ts" and len(parts) == 4:
+        await process_tp_set(query, callback_chain(parts[1]), parts[2], float(parts[3]))
+    elif action == "ss" and len(parts) == 4:
+        await process_sl_set(query, callback_chain(parts[1]), parts[2], float(parts[3]))
+    elif action == "tc" and len(parts) == 3:
         await query.answer()
-        context.user_data["awaiting_custom_tp"] = {"chain": parts[1], "token_address": parts[2]}
+        context.user_data["awaiting_custom_tp"] = {"chain": callback_chain(parts[1]), "token_address": parts[2]}
         await query.message.reply_text("Send your TP as a multiple of entry market cap, e.g. 4 for 4x")
-    elif action == "slcustom" and len(parts) == 3:
+    elif action == "sc" and len(parts) == 3:
         await query.answer()
-        context.user_data["awaiting_custom_sl"] = {"chain": parts[1], "token_address": parts[2]}
+        context.user_data["awaiting_custom_sl"] = {"chain": callback_chain(parts[1]), "token_address": parts[2]}
         await query.message.reply_text("Send your SL as a percent below entry market cap, e.g. 25 for -25%")
-    elif action == "backpos" and len(parts) == 3:
-        await process_back_to_position(query, parts[1], parts[2])
+    elif action == "bp" and len(parts) == 3:
+        await process_back_to_position(query, callback_chain(parts[1]), parts[2])
     elif action == "stgbuy":
         await query.answer()
         context.user_data["awaiting_settings_buy"] = True
