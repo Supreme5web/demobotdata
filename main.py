@@ -95,7 +95,7 @@ def get_buy_presets(user: Optional[dict], chain: str) -> list:
 # Compact chain codes keep Telegram callback_data safely under its 64-byte limit.
 # Full chain names + EVM/Solana addresses can otherwise exceed the limit.
 CALLBACK_CHAIN_CODES = {
-    "solana": "s",
+    "sol": "s",
     "bsc": "b",
     "robinhood": "r",
 }
