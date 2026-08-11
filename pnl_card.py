@@ -21,16 +21,12 @@ logger = logging.getLogger(__name__)
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "assets", "pnl_card_template.png")
 
 FONT_DIR = os.path.join(os.path.dirname(__file__), "assets", "fonts")
-FONT_BOLD = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
-FONT_REGULAR = os.path.join(FONT_DIR, "DejaVuSans.ttf")
 EMOJI_FONT = os.path.join(FONT_DIR, "NotoColorEmoji.ttf")
 
-# Stat-grid typography: Sora Bold for the main numeric values, Inter for
-# labels/secondary text, Orbitron Bold for the PNL percentage specifically.
-FONT_SORA_BOLD = os.path.join(FONT_DIR, "Sora-Bold.ttf")
-FONT_INTER_REGULAR = os.path.join(FONT_DIR, "Inter-Regular.ttf")
-FONT_INTER_MEDIUM = os.path.join(FONT_DIR, "Inter-Medium.ttf")
-FONT_ORBITRON_BOLD = os.path.join(FONT_DIR, "Orbitron-Bold.ttf")
+# Rajdhani everywhere: Bold for headings/values/numbers, Medium for labels
+# and secondary text (token symbol, username uses Bold to stay prominent).
+FONT_BOLD = os.path.join(FONT_DIR, "Rajdhani-Bold.ttf")
+FONT_REGULAR = os.path.join(FONT_DIR, "Rajdhani-Medium.ttf")
 
 # Colors
 WHITE = (255, 255, 255, 255)
@@ -244,9 +240,8 @@ def generate_pnl_card(trade: dict) -> str:
     draw = ImageDraw.Draw(overlay)
 
     symbol_font = _font(FONT_REGULAR, 34)
-    label_font = _font(FONT_INTER_MEDIUM, 26)
-    value_font = _font(FONT_SORA_BOLD, 46)
-    pnl_pct_font = _font(FONT_ORBITRON_BOLD, 46)  # PNL% only - same size as the other values
+    label_font = _font(FONT_REGULAR, 26)
+    value_font = _font(FONT_BOLD, 46)
 
     pnl = float(trade["pnl"])
     pnl_pct = float(trade["pnl_pct"])
@@ -298,7 +293,7 @@ def generate_pnl_card(trade: dict) -> str:
     _stat(draw, x, y, "PROFIT", f"{sign}{_fmt_usd(pnl)}", value_color=accent,
           label_font=label_font, value_font=value_font)
     _stat(draw, col2_x, y, "PNL", f"{sign}{pnl_pct:.2f}%", value_color=accent,
-          label_font=label_font, value_font=pnl_pct_font)
+          label_font=label_font, value_font=value_font)
 
     y += row_h
     _stat(draw, x, y, "DURATION", _format_duration(trade.get("duration_seconds", 0)),
