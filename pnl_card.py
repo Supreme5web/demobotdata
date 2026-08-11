@@ -25,6 +25,13 @@ FONT_BOLD = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")
 FONT_REGULAR = os.path.join(FONT_DIR, "DejaVuSans.ttf")
 EMOJI_FONT = os.path.join(FONT_DIR, "NotoColorEmoji.ttf")
 
+# Stat-grid typography: Sora Bold for the main numeric values, Inter for
+# labels/secondary text, Orbitron Bold for the PNL percentage specifically.
+FONT_SORA_BOLD = os.path.join(FONT_DIR, "Sora-Bold.ttf")
+FONT_INTER_REGULAR = os.path.join(FONT_DIR, "Inter-Regular.ttf")
+FONT_INTER_MEDIUM = os.path.join(FONT_DIR, "Inter-Medium.ttf")
+FONT_ORBITRON_BOLD = os.path.join(FONT_DIR, "Orbitron-Bold.ttf")
+
 # Colors
 WHITE = (255, 255, 255, 255)
 LABEL_GRAY = (148, 168, 200, 255)
@@ -207,9 +214,18 @@ def _draw_logo_placeholder(draw: ImageDraw.ImageDraw, box, symbol: str) -> None:
     draw.text((cx - w / 2 - bbox[0], cy - h / 2 - bbox[1]), letter, font=font, fill=WHITE)
 
 
+def _draw_accent_line(draw: ImageDraw.ImageDraw, x: int, y: int, width: int = 32, thickness: int = 3) -> None:
+    """Small cyan accent line under a stat label - a wider, low-opacity line
+    behind the crisp main line gives it a subtle glow without looking neon."""
+    glow_color = (CYAN[0], CYAN[1], CYAN[2], 70)
+    draw.line((x, y, x + width, y), fill=glow_color, width=thickness + 4)
+    draw.line((x, y, x + width, y), fill=CYAN, width=thickness)
+
+
 def _stat(draw, x, y, label, value, value_color=WHITE, label_font=None, value_font=None):
     draw.text((x, y), label, font=label_font, fill=LABEL_GRAY)
-    draw.text((x, y + 34), value, font=value_font, fill=value_color)
+    _draw_accent_line(draw, x, y + label_font.size + 4)
+    draw.text((x, y + 40), value, font=value_font, fill=value_color)
 
 
 def generate_pnl_card(trade: dict) -> str:
@@ -228,8 +244,9 @@ def generate_pnl_card(trade: dict) -> str:
     draw = ImageDraw.Draw(overlay)
 
     symbol_font = _font(FONT_REGULAR, 34)
-    label_font = _font(FONT_REGULAR, 26)
-    value_font = _font(FONT_BOLD, 46)
+    label_font = _font(FONT_INTER_MEDIUM, 26)
+    value_font = _font(FONT_SORA_BOLD, 46)
+    pnl_pct_font = _font(FONT_ORBITRON_BOLD, 46)  # PNL% only - same size as the other values
 
     pnl = float(trade["pnl"])
     pnl_pct = float(trade["pnl_pct"])
@@ -281,7 +298,7 @@ def generate_pnl_card(trade: dict) -> str:
     _stat(draw, x, y, "PROFIT", f"{sign}{_fmt_usd(pnl)}", value_color=accent,
           label_font=label_font, value_font=value_font)
     _stat(draw, col2_x, y, "PNL", f"{sign}{pnl_pct:.2f}%", value_color=accent,
-          label_font=label_font, value_font=value_font)
+          label_font=label_font, value_font=pnl_pct_font)
 
     y += row_h
     _stat(draw, x, y, "DURATION", _format_duration(trade.get("duration_seconds", 0)),
