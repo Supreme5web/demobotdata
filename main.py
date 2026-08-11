@@ -3,7 +3,7 @@
 No wallets, no private keys, no real transactions - everything here trades
 against a virtual USDC balance stored in Supabase. Solana, BSC, and
 Robinhood Chain, auto-detected from the shape (and, for the two EVM chains,
-a live DexScreener lookup) of whatever contract address the user sends.
+a live DexPaprika lookup) of whatever contract address the user sends.
 """
 
 import asyncio
@@ -57,7 +57,7 @@ async def resolve_chain(token_address: str) -> tuple[Optional[str], Optional[dic
     Solana and EVM addresses have different shapes and never collide, but
     BSC and Robinhood Chain are both EVM chains sharing the same 0x-hex
     format, so the shape alone can't disambiguate them. Instead, every
-    "evm"-kind chain is queried on DexScreener and whichever one actually
+    "evm"-kind chain is queried on DexPaprika and whichever one actually
     has this token listed (i.e. returns a real price) wins.
     """
     if SOLANA_CA_REGEX.match(token_address):

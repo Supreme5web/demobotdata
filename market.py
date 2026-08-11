@@ -8,7 +8,7 @@ address), where the slug comes from CHAINS[chain]["dexpaprika_network_id"]
 (e.g. "solana", "bsc"). We call GET /networks/{network}/tokens/{address},
 which returns DexPaprika's already-aggregated, liquidity-weighted view of
 the token (price, fdv, liquidity, volume) in a single call - no need to
-fetch every pool and pick the best one ourselves like DexScreener required.
+fetch every pool and pick the best one ourselves.
 
 The bot's demo trading currency is USDC, which is pegged 1:1 to USD, so
 unlike a chain's native gas token there's no price to fetch or convert -
