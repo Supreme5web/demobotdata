@@ -81,8 +81,8 @@ async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[d
     been fully populated yet - DexPaprika's own site flags this explicitly
     for very new chains (e.g. Robinhood Chain, live since July 2026):
     "Summary is present but summary.price_usd is missing, non-finite, or
-    zero." Also used when summary.24h.volume_usd is missing/zero, which
-    happens independently of price.
+    zero." Also used when summary.24h.volume_usd or the pool-level 1h
+    price change is missing/zero, which happen independently of price.
 
     Important: /search splits its response into three arrays, and only
     two of them carry market data. data["tokens"] is identity-only (name,
@@ -130,6 +130,7 @@ async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[d
         # authoritative over pool fields if that ever changes).
         merged.setdefault("price_usd", best_pool.get("price_usd"))
         merged["volume_usd"] = best_pool.get("volume_usd")
+        merged["last_price_change_usd_1h"] = best_pool.get("last_price_change_usd_1h")
     return merged
 
 
@@ -221,22 +222,23 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
     price_change_1h = _dig(result, "summary.1h.last_price_usd_change", "summary.1h.price_change", default=None)
 
     # DexPaprika also exposes 1h percentage changes on individual pools.
-    # Pick the highest-volume pool that has a non-null 1h change.
+    # Pick the highest-volume pool that has a non-null 1h change. Left as
+    # None (not defaulted to 0 yet) if nothing is found here - the /search
+    # fallback below gets a chance to fill it before we give up on it.
     if price_change_1h is None:
         pools = result.get("pools") or []
         candidates = [p for p in pools if p.get("last_price_change_usd_1h") is not None]
         if candidates:
             best_pool = max(candidates, key=lambda p: float(p.get("volume_usd") or 0))
             price_change_1h = best_pool.get("last_price_change_usd_1h")
-    if price_change_1h is None:
-        price_change_1h = 0
 
-    if price_usd <= 0 or not volume_24h:
-        # Summary endpoint came back empty on price and/or volume - try the
-        # /search fallback before giving up (see _query_dexpaprika_search
-        # docstring). These two are independent: a token can have a valid
-        # price but a missing/zero summary.24h.volume_usd, so this triggers
-        # on either gap rather than only on price.
+    if price_usd <= 0 or not volume_24h or price_change_1h is None:
+        # Summary endpoint came back empty on price, volume, and/or 1h
+        # change - try the /search fallback before giving up (see
+        # _query_dexpaprika_search docstring). These are independent gaps:
+        # a token can have a valid price but a missing 1h change (or vice
+        # versa), so this triggers on any one of them rather than requiring
+        # all three to be missing.
         fallback = await _query_dexpaprika_search(token_address, chain)
         if fallback:
             if price_usd <= 0:
@@ -250,11 +252,16 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
                 liquidity_usd = fallback.get("liquidity_usd") or 0
             if not volume_24h:
                 volume_24h = fallback.get("volume_usd") or fallback.get("volume_usd_24h") or 0
+            if price_change_1h is None:
+                price_change_1h = fallback.get("last_price_change_usd_1h")
             if price_usd > 0 or volume_24h:
                 logger.info(
-                    "DexPaprika summary lacked price/volume for %s/%s - used /search fallback instead.",
+                    "DexPaprika summary lacked price/volume/1h-change for %s/%s - used /search fallback instead.",
                     chain, token_address,
                 )
+
+    if price_change_1h is None:
+        price_change_1h = 0
 
     return {
         "token_address": token_address,
