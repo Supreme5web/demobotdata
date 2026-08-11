@@ -95,6 +95,15 @@ async def _query_dexpaprika_search(token_address: str, chain: str) -> Optional[d
     return None
 
 
+
+def _logo_url(token_address: str, chain: str) -> str:
+    """Return a stable token-logo URL for chains supported by DexScreener's
+    public token-image CDN. DexPaprika provides has_image but not the image URL.
+    """
+    chain_slug = {"sol": "solana", "bsc": "bsc", "robinhood": "robinhood"}.get(chain, chain)
+    return f"https://dd.dexscreener.com/ds-data/tokens/{chain_slug}/{token_address}.png"
+
+
 async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[dict]:
     """Fetch token info from DexPaprika for a given token address on the
     given chain (see CHAINS in config.py for supported chains). Returns
@@ -114,7 +123,18 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
     market_cap = _dig(result, "summary.fdv", default=0)
     liquidity_usd = _dig(result, "summary.liquidity_usd", default=0)
     volume_24h = _dig(result, "summary.24h.volume_usd", default=0)
-    price_change_1h = _dig(result, "summary.1h.last_price_usd_change", default=0)
+    price_change_1h = _dig(result, "summary.1h.last_price_usd_change", "summary.1h.price_change", default=None)
+
+    # DexPaprika also exposes 1h percentage changes on individual pools.
+    # Pick the highest-volume pool that has a non-null 1h change.
+    if price_change_1h is None:
+        pools = result.get("pools") or []
+        candidates = [p for p in pools if p.get("last_price_change_usd_1h") is not None]
+        if candidates:
+            best_pool = max(candidates, key=lambda p: float(p.get("volume_usd") or 0))
+            price_change_1h = best_pool.get("last_price_change_usd_1h")
+    if price_change_1h is None:
+        price_change_1h = 0
 
     if price_usd <= 0:
         # Summary endpoint came back empty on price - try the /search
@@ -152,7 +172,7 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
         # DexPaprika's token endpoint only returns a `has_image` boolean, not
         # a usable image URL, so this stays empty - pnl_card.py already
         # falls back to a letter badge when no logo is available.
-        "logo_url": "",
+        "logo_url": _logo_url(token_address, chain),
     }
 
 
