@@ -8,14 +8,20 @@ a live DexPaprika lookup) of whatever contract address the user sends.
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
+from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI
+try:
+    from google import genai
+except ImportError:  # Keeps the rest of the bot running if the SDK is not installed yet.
+    genai = None
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -655,6 +661,221 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     lines.append(f"<b>Overall Wallet PNL:</b> {pnl_symbol(total_pnl)} {fmt_usd(total_pnl)}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+def _parse_dt(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+def _avg(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds <= 0:
+        return "N/A"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{minutes:.0f}m"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{hours:.1f}h"
+    days = hours / 24
+    return f"{days:.1f}d"
+
+
+def _estimate_closed_holding_seconds(trades: list[dict]) -> list[float]:
+    """Estimate holding time by matching SELL amounts against earlier BUY lots.
+
+    Trades do not store an explicit close/open pair, so this uses FIFO lots
+    per token and chain. It is good enough for behavior analysis without
+    pretending to be exchange-grade accounting.
+    """
+    lots = defaultdict(list)
+    durations = []
+
+    for trade in trades:
+        created_at = _parse_dt(trade.get("created_at"))
+        if not created_at:
+            continue
+
+        key = (trade.get("chain") or DEFAULT_CHAIN, trade.get("token_address"))
+        side = trade.get("trade_type")
+        amount = float(trade.get("amount") or 0)
+
+        if side == "BUY" and amount > 0:
+            lots[key].append({"amount": amount, "created_at": created_at})
+            continue
+
+        if side != "SELL" or amount <= 0:
+            continue
+
+        remaining = amount
+        while remaining > 0 and lots[key]:
+            lot = lots[key][0]
+            matched = min(remaining, lot["amount"])
+            durations.append(max(0.0, (created_at - lot["created_at"]).total_seconds()))
+            lot["amount"] -= matched
+            remaining -= matched
+            if lot["amount"] <= 1e-12:
+                lots[key].pop(0)
+
+    return durations
+
+
+def build_trading_summary_payload(user: dict, trades: list[dict], positions: list[dict]) -> dict:
+    sells = [t for t in trades if t.get("trade_type") == "SELL"]
+    buys = [t for t in trades if t.get("trade_type") == "BUY"]
+    sell_pnls = [float(t.get("pnl") or 0) for t in sells]
+    wins = [p for p in sell_pnls if p > 0]
+    losses = [p for p in sell_pnls if p < 0]
+    buy_sizes = [float(t.get("total_value") or 0) for t in buys]
+    sell_sizes = [float(t.get("total_value") or 0) for t in sells]
+    closed_holding_seconds = _estimate_closed_holding_seconds(trades)
+
+    open_invested = sum(float(p.get("invested_amount") or 0) for p in positions)
+    open_unrealized = sum(float(p.get("unrealized_pnl") or 0) for p in positions)
+    open_holding_seconds = []
+    now = datetime.now(timezone.utc)
+    for position in positions:
+        created_at = _parse_dt(position.get("created_at"))
+        if created_at:
+            open_holding_seconds.append(max(0.0, (now - created_at).total_seconds()))
+
+    token_counts = Counter(t.get("token_symbol") or "UNKNOWN" for t in trades)
+    chain_counts = Counter(chain_label(t.get("chain") or DEFAULT_CHAIN) for t in trades)
+
+    return {
+        "user": {
+            "telegram_id": user.get("telegram_id"),
+            "username": user.get("username") or "",
+            "current_balance_usdc": round(float(user.get("balance") or 0), 2),
+        },
+        "activity": {
+            "total_trades": len(trades),
+            "buy_count": len(buys),
+            "sell_count": len(sells),
+            "open_positions": len(positions),
+            "most_traded_tokens": token_counts.most_common(5),
+            "chain_mix": chain_counts.most_common(),
+        },
+        "performance": {
+            "realized_pnl_usdc": round(sum(sell_pnls), 2),
+            "win_rate_pct": round((len(wins) / len(sells) * 100), 1) if sells else 0.0,
+            "wins": len(wins),
+            "losses": len(losses),
+            "breakeven_sells": len([p for p in sell_pnls if p == 0]),
+            "average_win_usdc": round(_avg(wins), 2),
+            "average_loss_usdc": round(_avg(losses), 2),
+            "largest_win_usdc": round(max(wins), 2) if wins else 0.0,
+            "largest_loss_usdc": round(min(losses), 2) if losses else 0.0,
+            "profit_factor": round((sum(wins) / abs(sum(losses))), 2) if losses else None,
+        },
+        "sizing": {
+            "average_buy_size_usdc": round(_avg(buy_sizes), 2),
+            "median_buy_size_usdc": round(sorted(buy_sizes)[len(buy_sizes) // 2], 2) if buy_sizes else 0.0,
+            "largest_buy_size_usdc": round(max(buy_sizes), 2) if buy_sizes else 0.0,
+            "average_sell_size_usdc": round(_avg(sell_sizes), 2),
+            "open_invested_usdc": round(open_invested, 2),
+            "open_unrealized_pnl_usdc": round(open_unrealized, 2),
+        },
+        "holding_time": {
+            "average_closed_holding_time": _format_duration(_avg(closed_holding_seconds)),
+            "average_open_holding_time": _format_duration(_avg(open_holding_seconds)),
+            "closed_holding_samples": len(closed_holding_seconds),
+            "note": "Closed holding time is FIFO-estimated from trade history because trades do not store explicit entry/exit pair IDs.",
+        },
+        "recent_trades": [
+            {
+                "side": t.get("trade_type"),
+                "symbol": t.get("token_symbol"),
+                "chain": chain_label(t.get("chain") or DEFAULT_CHAIN),
+                "value_usdc": round(float(t.get("total_value") or 0), 2),
+                "pnl_usdc": round(float(t.get("pnl") or 0), 2),
+                "created_at": t.get("created_at"),
+            }
+            for t in trades[-20:]
+        ],
+    }
+
+
+async def ask_gemini_for_trading_summary(payload: dict) -> str:
+    client = genai.Client(api_key=config.GEMINI_API_KEY)
+    aclient = client.aio
+    prompt = (
+        "You are analyzing a PaperBoat demo crypto trading user. "
+        "Use only the JSON stats provided. Keep the Telegram reply concise, practical, "
+        "and under 900 characters. Identify trading style, strengths, weaknesses, "
+        "notable patterns, and exactly one practical improvement. "
+        "Do not mention that you are an AI. Do not use markdown tables. "
+        "Return plain text with short labeled lines.\n\n"
+        f"Stats JSON:\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+    try:
+        response = await aclient.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config={"temperature": 0.35},
+        )
+        return (response.text or "").strip()
+    finally:
+        if hasattr(aclient, "aclose"):
+            await aclient.aclose()
+
+
+async def summary_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await get_user(update)
+
+    if genai is None:
+        await update.message.reply_text(
+            "Summary is not available yet. Install the google-genai package and redeploy."
+        )
+        return
+    if not config.GEMINI_API_KEY:
+        await update.message.reply_text(
+            "Summary is not available yet. Add GEMINI_API_KEY to your environment and redeploy."
+        )
+        return
+
+    trades = await db.get_trade_history(user["id"], limit=500)
+    positions = await db.get_positions(user["id"])
+    if not trades and not positions:
+        await update.message.reply_text("No trading history yet. Place a few demo trades, then send /summary again.")
+        return
+
+    await update.message.reply_text("Building your private trading summary...")
+
+    payload = build_trading_summary_payload(user, trades, positions)
+    try:
+        analysis = await ask_gemini_for_trading_summary(payload)
+    except Exception:
+        logger.exception("Gemini summary failed for user_id=%s", user.get("id"))
+        await update.message.reply_text("Could not generate your summary right now. Please try again later.")
+        return
+
+    stats = payload["performance"]
+    activity = payload["activity"]
+    sizing = payload["sizing"]
+    heading = (
+        "<b>PaperBoat Trading Summary</b>\n\n"
+        f"Trades: <b>{activity['total_trades']}</b> | Open: <b>{activity['open_positions']}</b>\n"
+        f"Realized PNL: <b>{pnl_symbol(stats['realized_pnl_usdc'])} {fmt_usd(stats['realized_pnl_usdc'])}</b>\n"
+        f"Win rate: <b>{stats['win_rate_pct']:.1f}%</b> "
+        f"({stats['wins']}W / {stats['losses']}L)\n"
+        f"Avg win/loss: <b>{fmt_usd(stats['average_win_usdc'])}</b> / "
+        f"<b>{fmt_usd(stats['average_loss_usdc'])}</b>\n"
+        f"Avg buy size: <b>{fmt_usd(sizing['average_buy_size_usdc'])}</b>\n\n"
+    )
+    message = heading + html.escape(analysis[:1800])
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -1364,6 +1585,7 @@ telegram_app.add_handler(CommandHandler("balance", balance_handler))
 telegram_app.add_handler(CommandHandler("positions", positions_handler))
 telegram_app.add_handler(CommandHandler("history", history_handler))
 telegram_app.add_handler(CommandHandler("settings", settings_handler))
+telegram_app.add_handler(CommandHandler("summary", summary_handler))
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 telegram_app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, delete_pin_service_message))

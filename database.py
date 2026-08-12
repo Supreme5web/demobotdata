@@ -186,6 +186,27 @@ async def get_trades(user_id: str, limit: int = 10) -> list:
     return await _run(_op)
 
 
+async def get_trade_history(user_id: str, limit: int = 500) -> list:
+    """Returns the user's recent trading history oldest-first for analytics.
+
+    The normal /history command stays capped and newest-first for display;
+    /summary needs enough rows, in chronological order, to estimate stats
+    like holding time and position-sizing patterns.
+    """
+    def _op():
+        res = (
+            supabase.table("trades")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        return res.data or []
+
+    return await _run(_op)
+
+
 async def get_total_realized_pnl(user_id: str) -> float:
     """Sums PNL across every SELL trade the user has ever made (all-time,
     not limited by the /history display cap)."""
