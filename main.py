@@ -47,6 +47,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# $PAPERBOAT token info shown on the /start menu.
+PAPERBOAT_TOKEN_ADDRESS = "5LUxw9fUCumDZEQJt7gxjyECfxRHeiSqL3hd627Dpump"
+PAPERBOAT_TWITTER_URL = "https://x.com/PAPERBOAT001"
+
 # Base58, 32-44 chars - matches typical Solana addresses.
 SOLANA_CA_REGEX = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 # 0x + 40 hex chars - standard EVM address format, shared by every EVM chain
@@ -479,23 +483,33 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = await get_user(update)
     balance_line = await balance_block(user)
     await update.message.reply_text(
-        "🚤 <b>PAPERBOAT</b> — Demo Trading Bot\n"
-        "Practice trading with real market data and zero risk.\n"
+        "🚤 <b>PAPERBOAT</b>\n"
+        "Practice trading with real market data — zero risk.\n"
         "No wallet. No private keys. No real funds.\n"
-        "All trades are simulated with a demo USDC balance.\n\n"
-        "⛓ Chains: Solana, BSC & Robinhood Chain (auto-detected)\n\n"
+        "Every trade is simulated using your virtual USDC balance.\n\n"
+
+        "<b>SUPPORTED CHAINS</b>\n"
+        "Solana • BSC • Robinhood Chain\n"
+        "Chain is detected automatically.\n\n"
+
         f"{balance_line}\n\n"
-        "📩 Send a token contract address to view live data and trade - "
-        "the chain is detected automatically from the address.\n"
-        "➕ Already holding a token? Tap Buy again on its position card to "
-        "add to it - your average entry updates automatically.\n"
-        "🎯 Set Take Profit / Stop Loss and let PaperBoat manage your "
-        "positions automatically.\n\n"
-        "<b>Commands:</b>\n"
+
+        "<b>HOW IT WORKS</b>\n"
+        "Send any token contract address to view live market data and start trading.\n"
+        "Already holding a token?\n"
+        "Tap Buy again on its position card to add to your position. Your average entry updates automatically.\n"
+        "Set Take Profit / Stop Loss and let PaperBoat manage your positions automatically.\n\n"
+
+        "<b>COMMANDS</b>\n"
         "/balance — Check balance\n"
-        "/positions — Open positions\n"
+        "/positions — View open positions\n"
         "/history — Trade history\n"
         "/start — Show menu\n\n"
+
+        "🪙 <b>$PAPERBOAT OFFICIAL CA</b>\n"
+        f"<code>{PAPERBOAT_TOKEN_ADDRESS}</code>\n"
+        f'𝕏 <a href="{PAPERBOAT_TWITTER_URL}">Follow us on Twitter</a>\n\n'
+
         "🛠 Built by @supremeesol",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
