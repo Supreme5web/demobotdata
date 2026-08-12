@@ -821,7 +821,7 @@ async def ask_gemini_for_trading_summary(payload: dict) -> str:
     )
     try:
         response = await aclient.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-2.5-flash-lite",
             contents=prompt,
             config={"temperature": 0.35},
         )
