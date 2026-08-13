@@ -17,6 +17,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 STARTING_BALANCE_USDC = 800.0
 PRICE_UPDATE_INTERVAL_SECONDS = 30
 
+# Soft-launch switch for Weekly Reset + Limit Orders. Keep this off to hide
+# both features (no menu entries, no /start mention, no button, and the
+# /reset and /orders commands aren't even registered) while the underlying
+# code stays live. Flip ENABLE_NEW_FEATURES=true in the environment and
+# restart the service to switch it on later - no code changes needed.
+ENABLE_NEW_FEATURES = os.getenv("ENABLE_NEW_FEATURES", "false").strip().lower() in ("1", "true", "yes")
+
 # Buy-button presets, in USDC. USDC is pegged 1:1 to USD, so - unlike a
 # chain's native gas token (SOL/BNB/ETH), whose USD value moves - these
 # numbers don't need a live price lookup to convert into demo USD balance

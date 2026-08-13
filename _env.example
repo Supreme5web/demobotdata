@@ -2,3 +2,8 @@ SUPABASE_URL=
 SUPABASE_KEY=
 TELEGRAM_TOKEN=
 GEMINI_API_KEY=
+
+# Set to true (and restart the service) to switch on Weekly Reset + Limit
+# Orders - menu entries, /start mention, the Limit Order button, and the
+# /reset & /orders commands are all hidden while this is false/unset.
+ENABLE_NEW_FEATURES=false

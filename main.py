@@ -14,7 +14,7 @@ import os
 import re
 from collections import Counter, defaultdict
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import FastAPI
@@ -482,6 +482,12 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     user = await get_user(update)
     balance_line = await balance_block(user)
+    new_feature_lines = (
+        "/orders — View open limit orders\n"
+        "/reset — Weekly balance reset (Fridays)\n"
+        if config.ENABLE_NEW_FEATURES
+        else ""
+    )
     await update.message.reply_text(
         "🚤 <b>PAPERBOAT</b>\n"
         "Practice trading with real market data — zero risk.\n"
@@ -503,7 +509,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "<b>COMMANDS</b>\n"
         "/balance — Check balance\n"
         "/positions — View open positions\n"
+        f"{new_feature_lines}"
         "/history — Trade history\n"
+        "/summary — AI trading summary\n"
+        "/settings — Buy buttons & default TP/SL\n"
         "/start — Show menu\n\n"
 
         "🪙 <b>$PAPERBOAT OFFICIAL CA</b>\n"
@@ -576,6 +585,104 @@ async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"{balance_line}",
         parse_mode=ParseMode.HTML,
     )
+
+
+# ---------------------------------------------------------------------------
+# Weekly reset
+# ---------------------------------------------------------------------------
+# Resets are only allowed on Fridays, and only once per 7-day window - a
+# user could otherwise tap /reset->Confirm every few minutes on a Friday
+# and keep re-topping their balance. last_reset_at (set by
+# db.reset_user_account) is the source of truth for "have they already used
+# this week's reset".
+
+def _reset_status(user: dict) -> tuple[bool, int]:
+    """Returns (available_now, days_until_next). `days_until_next` is 0
+    when available_now is True."""
+    now = datetime.now(timezone.utc)
+    last_reset = _parse_dt(user.get("last_reset_at"))
+    is_friday = now.weekday() == 4  # Monday=0 ... Friday=4
+    reset_recently = bool(last_reset) and (now - last_reset) < timedelta(days=6)
+
+    if is_friday and not reset_recently:
+        return True, 0
+
+    days = (4 - now.weekday()) % 7
+    if days == 0:
+        # It's Friday but already reset this week - next window is next Friday.
+        days = 7
+    return False, days
+
+
+async def reset_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await get_user(update)
+    available, days_left = _reset_status(user)
+
+    if available:
+        await update.message.reply_text(
+            "🔄 <b>Weekly Reset Available</b>\n\n"
+            f"This will reset your balance to <b>{fmt_usd(config.STARTING_BALANCE_USDC)} USDC</b> "
+            "and close all open positions (forfeited, not sold).\n"
+            "Your trade history is kept for reference.\n\n"
+            "This cannot be undone.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ Confirm Reset", callback_data="rstc"),
+                        InlineKeyboardButton("❌ Cancel", callback_data="rstx"),
+                    ]
+                ]
+            ),
+        )
+    else:
+        day_word = "day" if days_left == 1 else "days"
+        await update.message.reply_text(
+            "🔒 <b>Weekly Reset</b>\n\n"
+            "Available every Friday - once every 7 days.\n"
+            f"Next reset in <b>{days_left} {day_word}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def process_reset_confirm(query) -> None:
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+
+    available, _ = _reset_status(user)
+    if not available:
+        await query.answer("Weekly reset is no longer available.", show_alert=True)
+        return
+
+    closed_positions = await db.reset_user_account(user["id"], config.STARTING_BALANCE_USDC)
+    for pos in closed_positions:
+        chat_id = pos.get("pinned_chat_id")
+        message_id = pos.get("pinned_message_id")
+        if chat_id and message_id:
+            try:
+                await telegram_app.bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                logger.debug("Could not unpin position during reset", exc_info=True)
+
+    await query.answer("Balance reset!")
+    try:
+        await query.edit_message_text(
+            "✅ <b>Reset complete!</b>\n\n"
+            f"Your balance is now <b>{fmt_usd(config.STARTING_BALANCE_USDC)} USDC</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+
+
+async def process_reset_cancel(query) -> None:
+    await query.answer("Cancelled")
+    try:
+        await query.edit_message_text("Reset cancelled.")
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
 
 
 def build_positions_overview_keyboard(positions: list) -> InlineKeyboardMarkup:
@@ -931,6 +1038,10 @@ def build_token_info_keyboard(
     keyboard.append(
         [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"bc:{cc}:{token_address}")]
     )
+    if config.ENABLE_NEW_FEATURES:
+        keyboard.append(
+            [InlineKeyboardButton("🎯 Limit Order", callback_data=f"lo:{cc}:{token_address}")]
+        )
     keyboard.append(
         [
             InlineKeyboardButton("🔄 Refresh", callback_data=f"rt:{cc}:{token_address}"),
@@ -1068,6 +1179,181 @@ async def process_buy(update: Update, target, token_address: str, usdc_amount: f
                 "Could not delete origin buy message %s in chat %s",
                 delete_message_id, delete_chat_id, exc_info=True,
             )
+
+
+# ---------------------------------------------------------------------------
+# Limit orders
+# ---------------------------------------------------------------------------
+# A limit order is a queued buy that fires automatically once a token's
+# market cap crosses a target the user picks up front. Placement is a two-
+# step text flow (target market cap, then USDC amount), mirroring the
+# awaiting_custom_* pattern already used for custom buy/TP/SL below. Once
+# placed, price_update_loop's check_limit_orders() polls open orders
+# alongside the existing TP/SL monitor and executes trading.execute_buy()
+# when a target is hit.
+
+async def create_limit_order_flow(update: Update, token_address: str, chain: str, target_mcap: float, usdc_amount: float) -> None:
+    user = await get_user(update)
+    if usdc_amount > float(user["balance"]):
+        await update.message.reply_text(
+            f"⚠️ Insufficient demo balance. You have {fmt_usd(user['balance'])} USDC, "
+            f"this order needs {fmt_usd(usdc_amount)}."
+        )
+        return
+
+    token_data = await market.get_token_data(token_address, chain)
+    if not token_data or token_data["price_usd"] <= 0:
+        await update.message.reply_text("⚠️ Could not fetch a valid price for this token right now.")
+        return
+
+    current_mcap = float(token_data.get("market_cap") or 0)
+    if current_mcap <= 0:
+        await update.message.reply_text("⚠️ Could not read this token's market cap right now. Try again shortly.")
+        return
+
+    # Direction is fixed at creation time: "below" fires when mcap drops to
+    # or under the target (buying a dip), "above" fires when it rises to or
+    # past it (buying a breakout) - whichever side of the current mcap the
+    # target was on when the order was placed.
+    direction = "below" if target_mcap < current_mcap else "above"
+
+    await db.create_limit_order(
+        {
+            "user_id": user["id"],
+            "token_address": token_address,
+            "chain": chain,
+            "token_symbol": token_data["symbol"],
+            "token_name": token_data["name"],
+            "usdc_amount": usdc_amount,
+            "target_market_cap": target_mcap,
+            "direction": direction,
+            "status": "open",
+        }
+    )
+
+    arrow = "🔻 drops to" if direction == "below" else "🚀 rises to"
+    await update.message.reply_text(
+        "🎯 <b>Limit Order Placed</b>\n\n"
+        f"{html.escape(token_data['name'])} ({html.escape(token_data['symbol'])}) · {chain_label(chain)}\n"
+        f"Buy <b>{fmt_usd(usdc_amount)}</b> once market cap {arrow} <b>{fmt_compact(target_mcap)}</b>\n"
+        f"Current MCap: {fmt_compact(current_mcap)}\n\n"
+        "Manage open orders with /orders.",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+
+def build_limit_orders_view(orders: list) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    lines = ["📋 <b>OPEN LIMIT ORDERS</b>", ""]
+    rows = []
+    for o in orders:
+        arrow = "🔻" if o.get("direction") == "below" else "🚀"
+        symbol = o.get("token_symbol") or "???"
+        lines.append(
+            f"{arrow} <b>{html.escape(symbol)}</b> ({html.escape(chain_label(o.get('chain') or DEFAULT_CHAIN))}) — "
+            f"Buy {fmt_usd(o.get('usdc_amount'))} @ {fmt_compact(o.get('target_market_cap'))}"
+        )
+        rows.append([InlineKeyboardButton(f"❌ Cancel {symbol}", callback_data=f"loc:{o['id']}")])
+    keyboard = InlineKeyboardMarkup(rows) if rows else None
+    return "\n".join(lines), keyboard
+
+
+async def orders_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = await get_user(update)
+    orders = await db.get_open_limit_orders(user["id"])
+    if not orders:
+        await update.message.reply_text(
+            "📭 No open limit orders.\n\n"
+            "Open a token and tap 🎯 Limit Order to queue a buy at a target market cap."
+        )
+        return
+    text, keyboard = build_limit_orders_view(orders)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def process_cancel_limit_order(query, order_id: str) -> None:
+    await db.delete_limit_order(order_id)
+    tg_user = query.from_user
+    user = await db.get_or_create_user(tg_user.id, tg_user.username or tg_user.first_name)
+    orders = await db.get_open_limit_orders(user["id"])
+
+    if not orders:
+        try:
+            await query.edit_message_text("📭 No open limit orders.")
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+        await query.answer("Order cancelled")
+        return
+
+    text, keyboard = build_limit_orders_view(orders)
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            raise
+    await query.answer("Order cancelled")
+
+
+async def check_limit_orders() -> None:
+    """Scans open limit orders for a hit target market cap and executes the
+    queued buy, notifying the user in Telegram. A failed buy (e.g. balance
+    no longer sufficient) cancels the order instead of retrying forever."""
+    orders = await db.get_all_open_limit_orders()
+    for order in orders:
+        chain = order.get("chain") or DEFAULT_CHAIN
+        token_data = await market.get_token_data(order["token_address"], chain)
+        if not token_data or token_data["price_usd"] <= 0:
+            continue
+
+        current_mcap = float(token_data.get("market_cap") or 0)
+        if current_mcap <= 0:
+            continue
+
+        direction = order.get("direction")
+        target = float(order["target_market_cap"])
+        hit = (
+            (direction == "below" and current_mcap <= target)
+            or (direction == "above" and current_mcap >= target)
+        )
+        if not hit:
+            continue
+
+        user = await db.get_user_by_id(order["user_id"])
+        if not user:
+            await db.update_limit_order_status(order["id"], "cancelled")
+            continue
+
+        try:
+            result = await trading.execute_buy(user, order["token_address"], float(order["usdc_amount"]), chain)
+        except trading.TradingError as exc:
+            await db.update_limit_order_status(order["id"], "cancelled")
+            try:
+                await telegram_app.bot.send_message(
+                    chat_id=user["telegram_id"],
+                    text=f"⚠️ Limit order for {order.get('token_symbol', 'token')} was cancelled: {exc}",
+                )
+            except Exception:
+                logger.debug("Could not send limit-order cancel notice", exc_info=True)
+            continue
+        except Exception:
+            logger.exception("Limit order execution failed for order %s", order.get("id"))
+            continue
+
+        await db.update_limit_order_status(order["id"], "filled")
+
+        arrow = "🔻" if direction == "below" else "🚀"
+        trigger_text = (
+            f"{arrow} <b>Limit order filled</b>\n\n"
+            f"Bought <b>{fmt_usd(result['usd_amount'])}</b> of "
+            f"{html.escape(result['token_symbol'])} @ {fmt_compact(result['entry_market_cap'])} MCap"
+        )
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=user["telegram_id"], text=trigger_text, parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            logger.debug("Could not send limit-order fill notice", exc_info=True)
 
 
 async def process_tp_menu(query, chain: str, token_address: str) -> None:
@@ -1331,6 +1617,43 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
         return
 
+    pending_limit_mcap = context.user_data.get("awaiting_limit_mcap")
+    if pending_limit_mcap:
+        context.user_data.pop("awaiting_limit_mcap", None)
+        try:
+            target_mcap = float(text.replace(",", "").replace("$", "").strip())
+            if target_mcap <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please send a valid market cap, e.g. 5000000 for $5M")
+            return
+        context.user_data["awaiting_limit_amount"] = {
+            "chain": pending_limit_mcap["chain"],
+            "token_address": pending_limit_mcap["token_address"],
+            "target_market_cap": target_mcap,
+        }
+        await update.message.reply_text("Now send the USDC amount to buy once that target is hit, e.g. 100")
+        return
+
+    pending_limit_amount = context.user_data.get("awaiting_limit_amount")
+    if pending_limit_amount:
+        context.user_data.pop("awaiting_limit_amount", None)
+        try:
+            usdc_amount = float(text)
+            if usdc_amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please send a valid number, e.g. 100")
+            return
+        await create_limit_order_flow(
+            update,
+            pending_limit_amount["token_address"],
+            pending_limit_amount["chain"],
+            pending_limit_amount["target_market_cap"],
+            usdc_amount,
+        )
+        return
+
     if context.user_data.get("awaiting_settings_buy"):
         context.user_data.pop("awaiting_settings_buy", None)
         try:
@@ -1468,6 +1791,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
         context.user_data["awaiting_custom_sl"] = {"chain": callback_chain(parts[1]), "token_address": parts[2]}
         await query.message.reply_text("Send your SL as a percent below entry market cap, e.g. 25 for -25%")
+    elif action == "lo" and len(parts) == 3 and config.ENABLE_NEW_FEATURES:
+        await query.answer()
+        chain, token_address = callback_chain(parts[1]), parts[2]
+        context.user_data["awaiting_limit_mcap"] = {"chain": chain, "token_address": token_address}
+        await query.message.reply_text(
+            "Send your target market cap for this limit buy, e.g. 5000000 for $5M"
+        )
+    elif action == "loc" and len(parts) == 2 and config.ENABLE_NEW_FEATURES:
+        await process_cancel_limit_order(query, parts[1])
+    elif action == "rstc" and config.ENABLE_NEW_FEATURES:
+        await process_reset_confirm(query)
+    elif action == "rstx" and config.ENABLE_NEW_FEATURES:
+        await process_reset_cancel(query)
     elif action == "bp" and len(parts) == 3:
         await process_back_to_position(query, callback_chain(parts[1]), parts[2])
     elif action == "vp" and len(parts) == 3:
@@ -1600,6 +1936,9 @@ telegram_app.add_handler(CommandHandler("positions", positions_handler))
 telegram_app.add_handler(CommandHandler("history", history_handler))
 telegram_app.add_handler(CommandHandler("settings", settings_handler))
 telegram_app.add_handler(CommandHandler("summary", summary_handler))
+if config.ENABLE_NEW_FEATURES:
+    telegram_app.add_handler(CommandHandler("reset", reset_handler))
+    telegram_app.add_handler(CommandHandler("orders", orders_handler))
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 telegram_app.add_handler(MessageHandler(filters.StatusUpdate.PINNED_MESSAGE, delete_pin_service_message))
@@ -1609,17 +1948,23 @@ BOT_COMMANDS = [
     BotCommand("balance", "Check your demo balance"),
     BotCommand("positions", "View your open positions"),
     BotCommand("history", "View your recent trades"),
+    BotCommand("summary", "AI trading summary"),
     BotCommand("settings", "Customize buy buttons & default TP/SL"),
 ]
+if config.ENABLE_NEW_FEATURES:
+    BOT_COMMANDS.insert(4, BotCommand("orders", "View your open limit orders"))
+    BOT_COMMANDS.append(BotCommand("reset", "Weekly balance reset (Fridays)"))
 
 
 async def price_update_loop() -> None:
     """Background task: refresh open position prices/mcap/PNL every 30s,
-    then check for any take-profit/stop-loss targets that were hit."""
+    then check for any take-profit/stop-loss targets or limit orders that
+    were hit."""
     while True:
         try:
             await trading.refresh_all_positions()
             await check_tp_sl_triggers()
+            await check_limit_orders()
         except Exception:
             logger.exception("Price update loop failed")
         await asyncio.sleep(config.PRICE_UPDATE_INTERVAL_SECONDS)

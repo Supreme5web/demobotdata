@@ -6,6 +6,7 @@ wraps its call in asyncio.to_thread to avoid blocking the event loop.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from supabase import create_client, Client
@@ -88,6 +89,33 @@ async def get_user_by_id(user_id: str) -> Optional[dict]:
     return await _run(_op)
 
 
+async def reset_user_account(user_id: str, starting_balance: float) -> list:
+    """Weekly reset: closes every open position for the user (forfeited,
+    not sold - no trade rows are recorded) and restores their balance to
+    the starting demo amount, stamping last_reset_at so the weekly
+    eligibility check in main.py knows a reset already happened this week.
+
+    Returns the positions that were open immediately before deletion, so
+    the caller can unpin any Telegram messages that were pinned to them.
+    Trade history is untouched, so /history and /summary still reflect the
+    account's full lifetime activity across resets.
+    """
+    def _op():
+        positions = (
+            supabase.table("positions").select("*").eq("user_id", user_id).execute().data or []
+        )
+        supabase.table("positions").delete().eq("user_id", user_id).execute()
+        supabase.table("users").update(
+            {
+                "balance": starting_balance,
+                "last_reset_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ).eq("id", user_id).execute()
+        return positions
+
+    return await _run(_op)
+
+
 # ---------------------------------------------------------------------------
 # Positions
 # ---------------------------------------------------------------------------
@@ -156,6 +184,63 @@ async def set_position_tp_sl(
 async def delete_position(position_id: str) -> None:
     def _op():
         supabase.table("positions").delete().eq("id", position_id).execute()
+
+    await _run(_op)
+
+
+# ---------------------------------------------------------------------------
+# Limit orders
+# ---------------------------------------------------------------------------
+# A limit order is a queued buy: (user, token, chain, target market cap,
+# USDC amount to spend). "direction" records which way the target sits
+# relative to the market cap at the moment the order was placed ("below" =
+# buy the dip once mcap falls to the target, "above" = buy the breakout
+# once mcap rises to it) so the trigger check in main.py's
+# check_limit_orders() knows which comparison to use regardless of how
+# price wobbles afterward. Filled/cancelled orders are kept (status
+# updated) rather than deleted, so they double as a lightweight order
+# history if that's ever surfaced.
+
+async def create_limit_order(order: dict) -> dict:
+    def _op():
+        res = supabase.table("limit_orders").insert(order).execute()
+        return res.data[0]
+
+    return await _run(_op)
+
+
+async def get_open_limit_orders(user_id: str) -> list:
+    def _op():
+        res = (
+            supabase.table("limit_orders")
+            .select("*")
+            .eq("user_id", user_id)
+            .eq("status", "open")
+            .execute()
+        )
+        return res.data or []
+
+    return await _run(_op)
+
+
+async def get_all_open_limit_orders() -> list:
+    def _op():
+        res = supabase.table("limit_orders").select("*").eq("status", "open").execute()
+        return res.data or []
+
+    return await _run(_op)
+
+
+async def update_limit_order_status(order_id: str, status: str) -> None:
+    def _op():
+        supabase.table("limit_orders").update({"status": status}).eq("id", order_id).execute()
+
+    await _run(_op)
+
+
+async def delete_limit_order(order_id: str) -> None:
+    def _op():
+        supabase.table("limit_orders").delete().eq("id", order_id).execute()
 
     await _run(_op)
 
