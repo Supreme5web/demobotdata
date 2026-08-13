@@ -138,6 +138,56 @@ def _dexscreener_chain_slug(chain: str) -> str:
     return _DEXSCREENER_CHAIN_SLUGS.get(chain, chain)
 
 
+async def _query_dexscreener(token_address: str, chain: str) -> Optional[dict]:
+    """Fallback market-data source used when DexPaprika is unavailable
+    (rate-limited, paywalled, or erroring outright) or returns nothing
+    usable for a token. Hits DexScreener's GET /tokens/v1/{chainId}/{address}
+    endpoint - the same one _fetch_dexscreener_logo() already uses - and
+    picks whichever returned pair has the most USD liquidity as the
+    token's "primary" pair, mirroring how _query_dexpaprika_search() picks
+    a primary pool.
+
+    Returns a dict already shaped like DexPaprika's `summary` fields
+    (price_usd, fdv, liquidity_usd, volume_usd, price_change_1h) plus
+    pair_address/dex_url/name/symbol, or None if there's no matching pair
+    or the request fails."""
+    chain_slug = _dexscreener_chain_slug(chain)
+    url = f"{DEXSCREENER_API_BASE_URL}/tokens/v1/{chain_slug}/{token_address}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            pairs = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.error("DexScreener fallback failed (%s/%s): %s", chain, token_address, exc)
+        return None
+
+    if not isinstance(pairs, list) or not pairs:
+        return None
+
+    best_pair = max(pairs, key=lambda p: float(_dig(p, "liquidity.usd", default=0) or 0))
+
+    try:
+        price_usd = float(best_pair.get("priceUsd") or 0)
+    except (TypeError, ValueError):
+        price_usd = 0.0
+
+    base_token = best_pair.get("baseToken") or {}
+    return {
+        "name": base_token.get("name"),
+        "symbol": base_token.get("symbol"),
+        "price_usd": price_usd,
+        "fdv": _dig(best_pair, "fdv", "marketCap", default=0),
+        "liquidity_usd": _dig(best_pair, "liquidity.usd", default=0),
+        "volume_usd": _dig(best_pair, "volume.h24", default=0),
+        "price_change_1h": _dig(best_pair, "priceChange.h1", default=None),
+        "pair_address": best_pair.get("pairAddress") or "",
+        "dex_url": best_pair.get("url") or "",
+    }
+
+
 async def _fetch_dexscreener_logo(token_address: str, chain: str) -> Optional[str]:
     """Queries DexScreener's own GET /tokens/v1/{chainId}/{tokenAddress}
     endpoint for a verified logo. Unlike DexPaprika (which only exposes a
@@ -201,12 +251,36 @@ async def _resolve_logo_url(token_address: str, chain: str) -> str:
 
 
 async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Optional[dict]:
-    """Fetch token info from DexPaprika for a given token address on the
-    given chain (see CHAINS in config.py for supported chains). Returns
-    None if the token can't be found / the request fails."""
+    """Fetch token info for a given token address on the given chain (see
+    CHAINS in config.py for supported chains). DexPaprika is the primary
+    source; DexScreener is used as a fallback whenever DexPaprika is down
+    or rate/paywall-limited (429/402), or comes back with an empty/partial
+    summary that its own /search endpoint also can't fill in. Returns None
+    only if every source comes up empty."""
     result = await _query_dexpaprika(token_address, chain)
     if not result:
-        return None
+        # DexPaprika request failed outright (network error, 429, 402,
+        # etc. - see _query_dexpaprika) or the token isn't indexed there
+        # at all. Skip straight to DexScreener rather than trying
+        # DexPaprika's /search too, since that hits the same failing API.
+        ds = await _query_dexscreener(token_address, chain)
+        if not ds:
+            return None
+        logger.info("DexPaprika unavailable for %s/%s - used DexScreener fallback instead.", chain, token_address)
+        return {
+            "token_address": token_address,
+            "chain": chain,
+            "name": ds.get("name") or "Unknown Token",
+            "symbol": ds.get("symbol") or "???",
+            "price_usd": ds.get("price_usd") or 0,
+            "market_cap": ds.get("fdv") or 0,
+            "liquidity_usd": ds.get("liquidity_usd") or 0,
+            "volume_24h": ds.get("volume_usd") or 0,
+            "price_change_1h": ds.get("price_change_1h") or 0,
+            "pair_address": ds.get("pair_address") or "",
+            "dex_url": ds.get("dex_url") or "",
+            "logo_url": await _resolve_logo_url(token_address, chain),
+        }
 
     try:
         price_usd = float(_dig(result, "summary.price_usd", default=0) or 0)
@@ -259,6 +333,26 @@ async def get_token_data(token_address: str, chain: str = DEFAULT_CHAIN) -> Opti
                     "DexPaprika summary lacked price/volume/1h-change for %s/%s - used /search fallback instead.",
                     chain, token_address,
                 )
+
+        if price_usd <= 0:
+            # DexPaprika's own /search fallback still couldn't find a
+            # price (e.g. both endpoints are rate/paywall-limited right
+            # now) - try DexScreener before giving up on price entirely.
+            ds = await _query_dexscreener(token_address, chain)
+            if ds and ds.get("price_usd"):
+                logger.info(
+                    "DexPaprika had no usable price for %s/%s after /search - used DexScreener fallback instead.",
+                    chain, token_address,
+                )
+                price_usd = ds["price_usd"]
+                if not market_cap:
+                    market_cap = ds.get("fdv") or 0
+                if not liquidity_usd:
+                    liquidity_usd = ds.get("liquidity_usd") or 0
+                if not volume_24h:
+                    volume_24h = ds.get("volume_usd") or 0
+                if price_change_1h is None:
+                    price_change_1h = ds.get("price_change_1h")
 
     if price_change_1h is None:
         price_change_1h = 0
